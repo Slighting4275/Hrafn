@@ -346,9 +346,31 @@ async fn attach(tab: i64) -> Result<(), String> {
     if !(url.starts_with("http://") || url.starts_with("https://") || url.starts_with("file://") || url == "about:blank" || url.is_empty()) {
         return Err(format!("the browser does not allow extensions to control this page ({url})"));
     }
-    call(&["chrome", "debugger"], "attach", vec![to_js(&json!({"tabId": tab})), "1.3".into()])
-        .await
-        .map_err(|e| format!("could not attach to tab {tab}: {e} (close DevTools on that tab if it is open)"))?;
+    // Right after a click starts a cross-site navigation the browser can refuse to
+    // attach for a moment, so retry briefly before giving up.
+    let mut last_err = String::new();
+    let mut attached = false;
+    for attempt in 0..8 {
+        if attempt > 0 {
+            sleep(300).await;
+        }
+        match call(&["chrome", "debugger"], "attach", vec![to_js(&json!({"tabId": tab})), "1.3".into()]).await {
+            Ok(_) => {
+                attached = true;
+                break;
+            }
+            Err(e) if e.contains("Already attached") || e.contains("already attached") => {
+                attached = true;
+                break;
+            }
+            Err(e) => last_err = e,
+        }
+    }
+    if !attached {
+        return Err(format!(
+            "could not attach to tab {tab}: {last_err} (close DevTools on that tab if it is open; another extension's frame in the page can also block this)"
+        ));
+    }
     with(|s| {
         s.attached.insert(tab);
         s.logs.entry(tab).or_default();

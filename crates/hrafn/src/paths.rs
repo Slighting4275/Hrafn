@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 /// Where the installed host program lives (needs root to install, by design).
-pub const SYSTEM_HOST: &str = "/usr/local/libexec/hrafn/hrafn";
+pub const SYSTEM_HOST: &str = "/usr/local/libexec/hrafn/hrafn-host";
 
 /// Per-browser socket folders, relative to $HOME.
 pub const SOCKET_DIRS: [(&str, &str); 2] = [("Brave", ".config/BraveSoftware/hrafn"), ("Chrome", ".config/google-chrome/hrafn")];

@@ -7,7 +7,9 @@
 //! Protocol), and records console and network activity for attached tabs.
 
 pub mod ax;
+pub mod glob;
 pub mod keys;
+pub mod record;
 
 #[cfg(target_arch = "wasm32")]
 mod js;

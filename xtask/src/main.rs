@@ -57,8 +57,14 @@ pub fn dist() -> PathBuf {
     root().join("extension/dist")
 }
 
-pub fn host_binary() -> PathBuf {
+/// The command line client.
+pub fn cli_binary() -> PathBuf {
     root().join("target/release/hrafn")
+}
+
+/// The native messaging host the browser starts.
+pub fn host_binary() -> PathBuf {
+    root().join("target/release/hrafn-host")
 }
 
 pub fn build() {
@@ -106,7 +112,7 @@ pub fn host_manifest(program: &Path) -> String {
 
 /// Where the browser-side host must live: sandboxes (firejail's AppArmor profile)
 /// only let browsers run programs from system folders like this one.
-pub const SYSTEM_HOST: &str = "/usr/local/libexec/hrafn/hrafn";
+pub const SYSTEM_HOST: &str = "/usr/local/libexec/hrafn/hrafn-host";
 
 /// Is the installed system host the same program we just built?
 pub fn system_host_current() -> bool {
@@ -121,12 +127,12 @@ pub fn sudo_install_command() -> String {
 }
 
 /// Copy then rename, so a running host keeps its old file and nothing is half-written.
-pub fn install_program(dst: &Path) {
+pub fn install_program(src: &Path, dst: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let dir = dst.parent().unwrap();
     std::fs::create_dir_all(dir).unwrap();
     let tmp = dir.join(".hrafn.new");
-    std::fs::copy(host_binary(), &tmp).unwrap();
+    std::fs::copy(src, &tmp).unwrap();
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::rename(&tmp, dst).unwrap();
     eprintln!("installed {}", dst.display());
@@ -136,7 +142,7 @@ fn install() {
     build();
     let home = home();
     // The command you type.
-    install_program(&home.join(".local/bin/hrafn"));
+    install_program(&cli_binary(), &home.join(".local/bin/hrafn"));
 
     // Register the system host with each browser, and make the socket folder in the
     // browser's config folder (sandboxed browsers can write there; the CLI can reach it).

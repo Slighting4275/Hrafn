@@ -1,6 +1,6 @@
 //! The `hrafn` command line client.
 
-use crate::paths;
+use hrafn::paths;
 use base64::Engine;
 use hrafn_proto::{HOST_NAME, Request, Response};
 use serde_json::{Value, json};
@@ -29,7 +29,9 @@ Reading
   html <target>                Outer HTML of an element
 
 Acting (target = a ref like e12, or a CSS selector)
-  click <target> | hover <target> | focus <target>
+  click <target> [--double|--triple|--right] | click --at X,Y
+  dblclick <target> | rightclick <target> | hover <target> | focus <target>
+  drag <from> <to> [--steps N]   (or --from-at X,Y / --to-at X,Y)
   type <target> <text> [--append]
   select <target> <value>
   keys <combo>                 e.g. Enter, Tab, Escape, Control+A, Shift+ArrowDown
@@ -39,13 +41,31 @@ Waiting and capture
   wait <ms>                    Pause
   wait-stable [--ms N] [--timeout N]
                                Wait until the page is loaded and the network is quiet
+  wait-for <selector> | wait-for --text TEXT   [--gone] [--timeout MS]
+  diff                         What changed on the page since the last diff
   screenshot [file.png] [--full]
   eval <javascript>            Run JS in the page and print the result
 
-Logs and cookies
+Recording and replay
+  record start                 Record your clicks, typing, choices and Enter presses
+  record stop [plan-file]      Stop and save (or print) the steps as a plan
+  record status
+  run <plan-file | -> [--keep-going]
+                               Replay a plan: one hrafn command per line, # comments
+
+Logs, network and cookies
   console [--limit N] [--clear]
-  net log [--filter TEXT] [--limit N] | net clear
+  net log [--filter TEXT] [--limit N] | net body <id> [--out FILE] | net clear
+  sse [--filter TEXT] [--limit N] | sse clear        Server-sent event messages
+  headers [list] | headers add <name> <value> | headers remove <name> | headers clear
+  override [list] | override add <url-pattern> [--status N] [--type MIME]
+                                 [--body TEXT | --file PATH] | override clear
+                               Answer matching requests with a fake response
+                               (pattern: * = anything, e.g. '*/api/items*')
   cookies <domain> | cookies set '<json>' | cookies delete <url> <name>
+
+Page styling
+  style add '<css>' | style remove <id> | style clear
 
 Other
   detach                       Stop debugging the current tab (removes Brave's banner)
@@ -93,6 +113,7 @@ pub fn run(mut args: Vec<String>) -> i32 {
             0
         }
         "doctor" => doctor(),
+        "run" | "replay" => run_plan(rest, tab),
         "wait" => match rest.first().and_then(|m| m.parse::<u64>().ok()) {
             Some(ms) => {
                 std::thread::sleep(Duration::from_millis(ms));
@@ -133,6 +154,13 @@ fn flag(rest: &mut Vec<String>, f: &str) -> bool {
 
 fn num(v: Option<String>, name: &str) -> Result<Option<u64>, String> {
     v.map(|s| s.parse::<u64>().map_err(|_| format!("{name} needs a number"))).transpose()
+}
+
+/// "X,Y" -> [x, y]
+fn coords(s: &str) -> Result<[f64; 2], String> {
+    let (x, y) = s.split_once(',').ok_or_else(|| format!("expected X,Y but got `{s}`"))?;
+    let p = |v: &str| v.trim().parse::<f64>().map_err(|_| format!("expected X,Y but got `{s}`"));
+    Ok([p(x)?, p(y)?])
 }
 
 fn need(rest: &[String], n: usize, usage: &str) -> Result<(), String> {
@@ -179,10 +207,102 @@ fn build(cmd: &str, rest: &[String]) -> Result<(String, Value), String> {
             need(&r, 1, "find <words> [--role ROLE]")?;
             out("find", json!({ "query": r.join(" "), "role": role }))
         }
-        "click" | "hover" | "focus" | "html" => {
+        "click" | "dblclick" | "rightclick" | "hover" => {
+            let at = opt(&mut r, "--at").map(|s| coords(&s)).transpose()?;
+            let count = if cmd == "dblclick" || flag(&mut r, "--double") {
+                2
+            } else if flag(&mut r, "--triple") {
+                3
+            } else {
+                1
+            };
+            let button = if cmd == "rightclick" || flag(&mut r, "--right") { "right" } else { "left" };
+            if at.is_none() {
+                need(&r, 1, &format!("{cmd} <target> | {cmd} --at X,Y"))?;
+            }
+            let name = if cmd == "hover" { "hover" } else { "click" };
+            out(name, json!({ "target": r.first(), "at": at, "count": count, "button": button }))
+        }
+        "drag" => {
+            let from_at = opt(&mut r, "--from-at").map(|s| coords(&s)).transpose()?;
+            let to_at = opt(&mut r, "--to-at").map(|s| coords(&s)).transpose()?;
+            let steps = num(opt(&mut r, "--steps"), "--steps")?;
+            let mut words = r.iter();
+            let from = if from_at.is_none() { words.next().cloned() } else { None };
+            let to = if to_at.is_none() { words.next().cloned() } else { None };
+            if (from.is_none() && from_at.is_none()) || (to.is_none() && to_at.is_none()) {
+                return Err("usage: hrafn drag <from> <to> (or --from-at X,Y / --to-at X,Y) [--steps N]".into());
+            }
+            out("drag", json!({ "from": from, "to": to, "from_at": from_at, "to_at": to_at, "steps": steps }))
+        }
+        "focus" | "html" => {
             need(&r, 1, &format!("{cmd} <target>"))?;
             out(cmd, json!({ "target": r[0] }))
         }
+        "wait-for" => {
+            let text = opt(&mut r, "--text");
+            let timeout = num(opt(&mut r, "--timeout"), "--timeout")?;
+            let gone = flag(&mut r, "--gone");
+            if text.is_none() {
+                need(&r, 1, "wait-for <selector> | wait-for --text TEXT [--gone] [--timeout MS]")?;
+            }
+            out("wait_for", json!({ "selector": if text.is_none() { r.first().cloned() } else { None }, "text": text, "gone": gone, "timeout_ms": timeout }))
+        }
+        "diff" => out("diff", json!({})),
+        "style" => match r.first().map(String::as_str) {
+            Some("add") => {
+                need(&r, 2, "style add '<css>'")?;
+                out("style", json!({ "action": "add", "css": r[1..].join(" ") }))
+            }
+            Some("remove") => {
+                need(&r, 2, "style remove <id>")?;
+                out("style", json!({ "action": "remove", "id": r[1] }))
+            }
+            Some("clear") => out("style", json!({ "action": "clear" })),
+            _ => Err("usage: hrafn style add '<css>' | style remove <id> | style clear".into()),
+        },
+        "headers" => match r.first().map(String::as_str) {
+            None | Some("list") => out("headers", json!({ "action": "list" })),
+            Some("add") => {
+                need(&r, 3, "headers add <name> <value>")?;
+                out("headers", json!({ "action": "add", "name": r[1], "value": r[2..].join(" ") }))
+            }
+            Some("remove") => {
+                need(&r, 2, "headers remove <name>")?;
+                out("headers", json!({ "action": "remove", "name": r[1] }))
+            }
+            Some("clear") => out("headers", json!({ "action": "clear" })),
+            _ => Err("usage: hrafn headers [list] | headers add <name> <value> | headers remove <name> | headers clear".into()),
+        },
+        "override" => match r.first().map(String::as_str) {
+            None | Some("list") => out("override", json!({ "action": "list" })),
+            Some("clear") => out("override", json!({ "action": "clear" })),
+            Some("add") => {
+                let status = num(opt(&mut r, "--status"), "--status")?;
+                let ctype = opt(&mut r, "--type");
+                let body = match (opt(&mut r, "--body"), opt(&mut r, "--file")) {
+                    (Some(b), _) => b,
+                    (None, Some(f)) => std::fs::read_to_string(&f).map_err(|e| format!("could not read {f}: {e}"))?,
+                    (None, None) => String::new(),
+                };
+                if body.len() > 900_000 {
+                    return Err("override bodies are limited to about 900 KB".into());
+                }
+                need(&r, 2, "override add <url-pattern> [--status N] [--type MIME] [--body TEXT | --file PATH]")?;
+                out("override", json!({ "action": "add", "pattern": r[1], "status": status, "content_type": ctype, "body": body }))
+            }
+            _ => Err("usage: hrafn override [list] | override add <url-pattern> ... | override clear".into()),
+        },
+        "sse" => {
+            let action = r.first().filter(|a| !a.starts_with("--")).cloned().unwrap_or_else(|| "log".into());
+            let filter = opt(&mut r, "--filter");
+            let limit = num(opt(&mut r, "--limit"), "--limit")?;
+            out("sse", json!({ "action": action, "filter": filter, "limit": limit, "clear": action == "clear" }))
+        }
+        "record" => match r.first().map(String::as_str) {
+            Some(a @ ("start" | "stop" | "status")) => out("record", json!({ "action": a })),
+            _ => Err("usage: hrafn record start | record stop [plan-file] | record status".into()),
+        },
         "type" => {
             let append = flag(&mut r, "--append");
             need(&r, 2, "type <target> <text> [--append]")?;
@@ -222,8 +342,12 @@ fn build(cmd: &str, rest: &[String]) -> Result<(String, Value), String> {
         }
         "net" => {
             let action = r.first().cloned().unwrap_or_else(|| "log".into());
+            if action == "body" {
+                need(&r, 2, "net body <request-id> [--out FILE]")?;
+                return out("net", json!({ "action": "body", "id": r[1] }));
+            }
             if action != "log" && action != "clear" {
-                return Err("usage: hrafn net log [--filter TEXT] [--limit N] | net clear".into());
+                return Err("usage: hrafn net log [--filter TEXT] [--limit N] | net body <id> [--out FILE] | net clear".into());
             }
             let filter = opt(&mut r, "--filter");
             let limit = num(opt(&mut r, "--limit"), "--limit")?;
@@ -282,6 +406,25 @@ fn send_and_print(cmd: &str, args: Value, tab: Option<i64>, raw_json: bool, rest
     if cmd == "screenshot" {
         return save_screenshot(&res, rest);
     }
+    if cmd == "record" && res.get("steps").is_some() {
+        let plan = crate::plan::from_steps(res["start_url"].as_str().unwrap_or(""), res["steps"].as_array().map(Vec::as_slice).unwrap_or(&[]));
+        return match rest.get(1) {
+            Some(file) => match std::fs::write(file, &plan) {
+                Ok(()) => {
+                    println!("saved {} step(s) to {file}; replay with: hrafn run {file}", plan.lines().filter(|l| !l.starts_with('#')).count());
+                    0
+                }
+                Err(e) => fail(format!("could not write {file}: {e}")),
+            },
+            None => {
+                print!("{plan}");
+                0
+            }
+        };
+    }
+    if cmd == "net" && res.get("body").is_some() {
+        return net_body(&res, rest);
+    }
     if raw_json {
         println!("{}", serde_json::to_string_pretty(&res).unwrap_or_default());
         return 0;
@@ -319,10 +462,17 @@ fn send_and_print(cmd: &str, args: Value, tab: Option<i64>, raw_json: bool, rest
                 println!("[{}] {}", e["level"].as_str().unwrap_or("log"), e["text"].as_str().unwrap_or(""));
             }
         }
+        "sse" => {
+            for e in res.as_array().into_iter().flatten() {
+                let ev = e["event"].as_str().filter(|s| !s.is_empty()).unwrap_or("message");
+                println!("[{ev}] {}", e["data"].as_str().unwrap_or(""));
+            }
+        }
         "net" => {
             for e in res.as_array().into_iter().flatten() {
                 println!(
-                    "{:>4} {:6} {:10} {}",
+                    "{:<14} {:>4} {:6} {:10} {}",
+                    e["id"].as_str().unwrap_or(""),
                     e["status"].as_i64().map(|s| s.to_string()).unwrap_or_else(|| if e["failed"].is_string() { "ERR".into() } else { "…".into() }),
                     e["method"].as_str().unwrap_or(""),
                     e["type"].as_str().unwrap_or(""),
@@ -337,6 +487,112 @@ fn send_and_print(cmd: &str, args: Value, tab: Option<i64>, raw_json: bool, rest
         },
     }
     0
+}
+
+fn net_body(res: &Value, rest: &[String]) -> i32 {
+    let body = res["body"].as_str().unwrap_or("");
+    let bytes = if res["base64"].as_bool() == Some(true) {
+        match base64::engine::general_purpose::STANDARD.decode(body) {
+            Ok(b) => b,
+            Err(e) => return fail(format!("bad body data: {e}")),
+        }
+    } else {
+        body.as_bytes().to_vec()
+    };
+    let out = rest.iter().position(|a| a == "--out").and_then(|i| rest.get(i + 1));
+    match out {
+        Some(path) => match std::fs::write(path, &bytes) {
+            Ok(()) => {
+                println!("{path} ({} bytes)", bytes.len());
+                0
+            }
+            Err(e) => fail(format!("could not write {path}: {e}")),
+        },
+        None => match String::from_utf8(bytes) {
+            Ok(text) => {
+                println!("{text}");
+                0
+            }
+            Err(e) => fail(format!("binary body ({} bytes); save it with --out FILE", e.as_bytes().len())),
+        },
+    }
+}
+
+/// Commands after which a replay waits for the page to settle.
+const SETTLE_AFTER: [&str; 11] = ["open", "navigate", "back", "forward", "reload", "click", "type", "select", "keys", "drag", "tab"];
+
+/// Run a plan file (or `-` for stdin): one command per line.
+fn run_plan(rest: &[String], tab: Option<i64>) -> i32 {
+    let keep_going = rest.iter().any(|a| a == "--keep-going");
+    let Some(src) = rest.iter().find(|a| !a.starts_with("--")) else {
+        return fail("usage: hrafn run <plan-file | -> [--keep-going]");
+    };
+    let text = if src == "-" {
+        let mut s = String::new();
+        if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut s) {
+            return fail(format!("could not read stdin: {e}"));
+        }
+        s
+    } else {
+        match std::fs::read_to_string(src) {
+            Ok(s) => s,
+            Err(e) => return fail(format!("could not read {src}: {e}")),
+        }
+    };
+    let (mut passed, mut failed) = (0, 0);
+    for (n, line) in text.lines().enumerate() {
+        let words = match crate::plan::split(line) {
+            Ok(Some(w)) => w,
+            Ok(None) => continue,
+            Err(e) => {
+                println!("FAIL line {}: {e}", n + 1);
+                failed += 1;
+                if keep_going { continue } else { break }
+            }
+        };
+        let (cmd, args) = (&words[0], &words[1..]);
+        let result: Result<String, String> = if cmd == "wait" {
+            match args.first().and_then(|m| m.parse::<u64>().ok()) {
+                Some(ms) => {
+                    std::thread::sleep(Duration::from_millis(ms));
+                    Ok(format!("waited {ms} ms"))
+                }
+                None => Err("usage: wait <ms>".into()),
+            }
+        } else if ["run", "doctor", "help", "screenshot"].contains(&cmd.as_str()) {
+            Err(format!("`{cmd}` can't be used inside a plan"))
+        } else {
+            build(cmd, args).and_then(|(name, a)| call(&name, a, tab)).and_then(|resp| {
+                if resp.ok {
+                    Ok(match &resp.result {
+                        Value::String(s) => s.clone(),
+                        Value::Object(o) if o.contains_key("title") => o["title"].as_str().unwrap_or("").to_string(),
+                        _ => "ok".into(),
+                    })
+                } else {
+                    Err(resp.error.unwrap_or_else(|| "failed".into()))
+                }
+            })
+        };
+        match result {
+            Ok(msg) => {
+                passed += 1;
+                println!("ok   line {}: {}  ({})", n + 1, line.trim(), msg.lines().next().unwrap_or(""));
+                if SETTLE_AFTER.contains(&cmd.as_str()) {
+                    let _ = call("wait_stable", json!({ "quiet_ms": 300, "timeout_ms": 8000 }), tab);
+                }
+            }
+            Err(e) => {
+                failed += 1;
+                println!("FAIL line {}: {}  ({e})", n + 1, line.trim());
+                if !keep_going {
+                    break;
+                }
+            }
+        }
+    }
+    println!("{passed} passed, {failed} failed");
+    if failed == 0 { 0 } else { 1 }
 }
 
 fn save_screenshot(res: &Value, rest: &[String]) -> i32 {
@@ -434,6 +690,34 @@ mod tests {
         assert_eq!(b("read", &["--max-chars", "500"]).unwrap().1["max_chars"], 500);
         assert_eq!(b("net", &["log", "--filter", "api", "--limit", "5"]).unwrap().1, json!({"action":"log","filter":"api","limit":5}));
         assert_eq!(b("cookies", &["example.com"]).unwrap().1, json!({"action":"get","domain":"example.com"}));
+    }
+
+    #[test]
+    fn builds_extra_commands() {
+        assert_eq!(b("dblclick", &["#a"]).unwrap().1, json!({"target":"#a","at":null,"count":2,"button":"left"}));
+        assert_eq!(b("click", &["--at", "10,20.5", "--right"]).unwrap().1, json!({"target":null,"at":[10.0,20.5],"count":1,"button":"right"}));
+        assert_eq!(b("drag", &["#a", "#b", "--steps", "5"]).unwrap().1, json!({"from":"#a","to":"#b","from_at":null,"to_at":null,"steps":5}));
+        assert_eq!(b("drag", &["--from-at", "1,2", "#b"]).unwrap().1["to"], "#b");
+        assert_eq!(b("wait-for", &["--text", "Done", "--gone"]).unwrap().1, json!({"selector":null,"text":"Done","gone":true,"timeout_ms":null}));
+        assert_eq!(b("style", &["add", "body", "{color:red}"]).unwrap().1["css"], "body {color:red}");
+        assert_eq!(b("headers", &["add", "X-Test", "yes"]).unwrap().1, json!({"action":"add","name":"X-Test","value":"yes"}));
+        assert_eq!(
+            b("override", &["add", "*/api/*", "--status", "503", "--body", "{}"]).unwrap().1,
+            json!({"action":"add","pattern":"*/api/*","status":503,"content_type":null,"body":"{}"})
+        );
+        assert_eq!(b("net", &["body", "123.4"]).unwrap().1, json!({"action":"body","id":"123.4"}));
+        assert_eq!(b("sse", &["--limit", "3"]).unwrap().1["action"], "log");
+        assert_eq!(b("record", &["start"]).unwrap().1, json!({"action":"start"}));
+    }
+
+    #[test]
+    fn rejects_bad_extra_input() {
+        assert!(b("click", &["--at", "10"]).is_err());
+        assert!(b("drag", &["#a"]).is_err());
+        assert!(b("wait-for", &[]).is_err());
+        assert!(b("record", &["pause"]).is_err());
+        assert!(b("override", &["add"]).is_err());
+        assert!(b("override", &["add", "*", "--file", "/no/such/file"]).is_err());
     }
 
     #[test]

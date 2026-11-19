@@ -16,8 +16,26 @@ const DEFAULT_MAX_CHARS: usize = 30_000;
 struct TabLog {
     console: VecDeque<Value>,
     net: VecDeque<Value>,
+    sse: VecDeque<Value>,
     inflight: i64,
     last_net: f64,
+}
+
+/// A recording in progress on one tab.
+#[derive(Default)]
+struct Recording {
+    start_url: String,
+    steps: Vec<Value>,
+    script_id: Option<String>,
+}
+
+/// A fake response for requests whose URL matches `pattern`.
+#[derive(Clone)]
+struct Override {
+    pattern: String,
+    status: u16,
+    content_type: String,
+    body: String,
 }
 
 #[derive(Default)]
@@ -28,7 +46,49 @@ struct State {
     attached: HashSet<i64>,
     refs: HashMap<i64, HashMap<String, i64>>,
     logs: HashMap<i64, TabLog>,
+    recordings: HashMap<i64, Recording>,
+    overrides: HashMap<i64, Vec<Override>>,
+    headers: HashMap<i64, serde_json::Map<String, Value>>,
+    last_tree: HashMap<i64, String>,
+    style_seq: u32,
 }
+
+/// Page-side recorder. It has to be JavaScript because it runs inside the page; it
+/// only reports events to Rust (through the `__hrafnRecord` binding), which decides
+/// what becomes a step.
+const RECORDER_JS: &str = r#"(() => {
+  if (window.__hrafnRecorder) return; window.__hrafnRecorder = true;
+  const esc = (s) => (window.CSS && CSS.escape) ? CSS.escape(s) : s.replace(/"/g, '\\"');
+  const sel = (e) => {
+    if (!(e instanceof Element)) return null;
+    if (e.id) return '#' + esc(e.id);
+    for (const a of ['data-testid', 'name', 'aria-label']) {
+      const v = e.getAttribute(a);
+      if (v) return e.tagName.toLowerCase() + '[' + a + '="' + v.replace(/"/g, '\\"') + '"]';
+    }
+    const path = []; let n = e;
+    while (n && n.nodeType === 1 && path.length < 6) {
+      if (n.id) { path.unshift('#' + esc(n.id)); break; }
+      let s = n.tagName.toLowerCase(); const p = n.parentElement;
+      if (p) { const same = [...p.children].filter((c) => c.tagName === n.tagName);
+        if (same.length > 1) s += ':nth-of-type(' + (same.indexOf(n) + 1) + ')'; }
+      path.unshift(s); n = p;
+    }
+    return path.join(' > ');
+  };
+  const send = (o) => { try { __hrafnRecord(JSON.stringify(o)); } catch (_) {} };
+  const textLike = (t) => t && (t.tagName === 'TEXTAREA' || t.isContentEditable ||
+    (t.tagName === 'INPUT' && !['checkbox', 'radio', 'button', 'submit', 'reset', 'file', 'image'].includes(t.type)));
+  addEventListener('click', (e) => { if (e.detail <= 1) send({ type: 'click', target: sel(e.target) }); }, true);
+  addEventListener('dblclick', (e) => send({ type: 'dblclick', target: sel(e.target) }), true);
+  addEventListener('input', (e) => { const t = e.target;
+    if (textLike(t)) send({ type: 'type', target: sel(t), text: t.isContentEditable ? t.textContent : t.value }); }, true);
+  addEventListener('change', (e) => { const t = e.target;
+    if (t.tagName === 'SELECT') send({ type: 'select', target: sel(t), value: t.value }); }, true);
+  addEventListener('keydown', (e) => {
+    if (['Enter', 'Escape', 'Tab'].includes(e.key) && !e.ctrlKey && !e.altKey && !e.metaKey) send({ type: 'keys', combo: e.key });
+  }, true);
+})()"#;
 
 thread_local! {
     static STATE: RefCell<State> = RefCell::new(State { reconnect_delay: 1000, ..Default::default() });
@@ -73,6 +133,10 @@ pub fn start() {
                     s.attached.remove(&t);
                     s.refs.remove(&t);
                     s.logs.remove(&t);
+                    s.recordings.remove(&t);
+                    s.overrides.remove(&t);
+                    s.headers.remove(&t);
+                    s.last_tree.remove(&t);
                     if s.current_tab == Some(t) {
                         s.current_tab = None;
                     }
@@ -195,12 +259,52 @@ fn on_cdp_event(tab: i64, method: &str, p: Value) {
                 log.inflight = (log.inflight - 1).max(0);
                 log.last_net = t;
             }
+            "Network.eventSourceMessageReceived" => {
+                let url = log.net.iter().rev().find(|e| e["id"] == p["requestId"]).map(|e| e["url"].clone()).unwrap_or(Value::Null);
+                push(&mut log.sse, json!({"ts": t, "id": p["requestId"], "url": url, "event": p["eventName"], "data": p["data"]}));
+            }
             "Page.frameNavigated" if p["frame"].get("parentId").is_none() => {
                 s.refs.remove(&tab);
+                if let Some(rec) = s.recordings.get_mut(&tab) {
+                    rec.steps.push(json!({"type": "navigate", "url": p["frame"]["url"]}));
+                }
+            }
+            "Runtime.bindingCalled" if p["name"] == "__hrafnRecord" => {
+                if let (Some(rec), Some(step)) = (
+                    s.recordings.get_mut(&tab),
+                    p["payload"].as_str().and_then(|j| serde_json::from_str::<Value>(j).ok()),
+                ) {
+                    crate::record::record_step(&mut rec.steps, step);
+                }
             }
             _ => {}
         }
     });
+    if method == "Fetch.requestPaused" {
+        spawn_local(answer_paused(tab, p));
+    }
+}
+
+/// Answer an intercepted request with its override, or let it through.
+async fn answer_paused(tab: i64, p: Value) {
+    use base64::Engine;
+    let url = p["request"]["url"].as_str().unwrap_or("").to_string();
+    let id = p["requestId"].clone();
+    let hit = with(|s| s.overrides.get(&tab).and_then(|list| list.iter().find(|o| crate::glob::matches(&o.pattern, &url)).cloned()));
+    let _ = match hit {
+        Some(o) => {
+            let body = base64::engine::general_purpose::STANDARD.encode(o.body.as_bytes());
+            cdp_raw(
+                tab,
+                "Fetch.fulfillRequest",
+                json!({"requestId": id, "responseCode": o.status,
+                       "responseHeaders": [{"name": "Content-Type", "value": o.content_type}, {"name": "Access-Control-Allow-Origin", "value": "*"}],
+                       "body": body}),
+            )
+            .await
+        }
+        None => cdp_raw(tab, "Fetch.continueRequest", json!({"requestId": id})).await,
+    };
 }
 
 // ------------------------------------------------------------------ helpers
@@ -252,7 +356,7 @@ async fn attach(tab: i64) -> Result<(), String> {
     for domain in ["Page.enable", "Runtime.enable", "Network.enable", "Log.enable", "DOM.enable"] {
         cdp_raw(tab, domain, json!({})).await?;
     }
-    Ok(())
+    apply_tab_settings(tab).await
 }
 
 async fn cdp_raw(tab: i64, method: &str, params: Value) -> Result<Value, String> {
@@ -354,12 +458,78 @@ async fn center(tab: i64, backend: i64) -> Result<(f64, f64), String> {
 }
 
 async fn mouse(tab: i64, kind: &str, x: f64, y: f64) -> Result<(), String> {
+    mouse_btn(tab, kind, x, y, "left", 1).await
+}
+
+async fn mouse_btn(tab: i64, kind: &str, x: f64, y: f64, button: &str, count: u32) -> Result<(), String> {
     let mut p = json!({"type": kind, "x": x, "y": y});
     if kind != "mouseMoved" {
-        p["button"] = json!("left");
-        p["clickCount"] = json!(1);
+        p["button"] = json!(button);
+        p["clickCount"] = json!(count);
+    } else if button != "none" && count > 0 {
+        // A move while a button is held (dragging).
+        p["button"] = json!(button);
+        p["buttons"] = json!(1);
     }
     cdp(tab, "Input.dispatchMouseEvent", p).await.map(|_| ())
+}
+
+/// A point to act on: `at: [x, y]`, else the centre of `target` (ref or selector).
+async fn point(r: &Request, tab: i64, target_key: &str, at_key: &str) -> Result<(f64, f64, String), String> {
+    if let Some(at) = arg(r, at_key).as_array() {
+        let x = at.first().and_then(Value::as_f64).ok_or("bad x")?;
+        let y = at.get(1).and_then(Value::as_f64).ok_or("bad y")?;
+        return Ok((x, y, format!("{x},{y}")));
+    }
+    let target = arg_str(r, target_key)?;
+    let b = resolve(tab, &target).await?;
+    let (x, y) = center(tab, b).await?;
+    Ok((x, y, target))
+}
+
+/// Re-apply per-tab settings after (re)attaching: headers, overrides, recorder.
+async fn apply_tab_settings(tab: i64) -> Result<(), String> {
+    let (headers, overrides, recording) = with(|s| {
+        (
+            s.headers.get(&tab).cloned(),
+            s.overrides.get(&tab).map(|v| v.iter().map(|o| o.pattern.clone()).collect::<Vec<_>>()),
+            s.recordings.contains_key(&tab),
+        )
+    });
+    if let Some(h) = headers {
+        cdp_raw(tab, "Network.setExtraHTTPHeaders", json!({"headers": h})).await?;
+    }
+    match overrides {
+        Some(patterns) if !patterns.is_empty() => {
+            let p: Vec<Value> = patterns.iter().map(|u| json!({"urlPattern": u, "requestStage": "Request"})).collect();
+            cdp_raw(tab, "Fetch.enable", json!({"patterns": p})).await?;
+        }
+        _ => {
+            let _ = cdp_raw(tab, "Fetch.disable", json!({})).await;
+        }
+    }
+    if recording {
+        install_recorder(tab).await?;
+    }
+    Ok(())
+}
+
+async fn install_recorder(tab: i64) -> Result<(), String> {
+    cdp_raw(tab, "Runtime.addBinding", json!({"name": "__hrafnRecord"})).await?;
+    let r = cdp_raw(tab, "Page.addScriptToEvaluateOnNewDocument", json!({"source": RECORDER_JS})).await?;
+    let id = r["identifier"].as_str().map(String::from);
+    with(|s| {
+        if let Some(rec) = s.recordings.get_mut(&tab) {
+            rec.script_id = id;
+        }
+    });
+    cdp_raw(tab, "Runtime.evaluate", json!({"expression": RECORDER_JS})).await?;
+    Ok(())
+}
+
+/// JSON string literal, for putting a value into a small JS expression safely.
+fn js_str(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
 }
 
 // ------------------------------------------------------------------ commands
@@ -501,18 +671,200 @@ async fn page_command(r: &Request, tab: i64) -> Result<Value, String> {
             Ok(cdp(tab, "DOM.getOuterHTML", json!({"backendNodeId": b})).await?["outerHTML"].clone())
         }
         "click" | "hover" => {
-            let target = arg_str(r, "target")?;
-            let b = resolve(tab, &target).await?;
-            let (x, y) = center(tab, b).await?;
+            let (x, y, what) = point(r, tab, "target", "at").await?;
             mouse(tab, "mouseMoved", x, y).await?;
+            let mut verb = "hovering over";
             if r.cmd == "click" {
-                mouse(tab, "mousePressed", x, y).await?;
-                mouse(tab, "mouseReleased", x, y).await?;
+                let button = arg(r, "button").as_str().unwrap_or("left").to_string();
+                let count = arg(r, "count").as_u64().unwrap_or(1).clamp(1, 3) as u32;
+                for n in 1..=count {
+                    mouse_btn(tab, "mousePressed", x, y, &button, n).await?;
+                    mouse_btn(tab, "mouseReleased", x, y, &button, n).await?;
+                }
                 sleep(300).await;
+                verb = match (button.as_str(), count) {
+                    ("right", _) => "right-clicked",
+                    (_, 2) => "double-clicked",
+                    (_, 3) => "triple-clicked",
+                    _ => "clicked",
+                };
             }
             let info = tab_info(tab).await?;
-            Ok(json!(format!("{} {target} — now at {}", if r.cmd == "click" { "clicked" } else { "hovering" }, info["url"].as_str().unwrap_or(""))))
+            Ok(json!(format!("{verb} {what} — now at {}", info["url"].as_str().unwrap_or(""))))
         }
+        "drag" => {
+            let (x1, y1, from) = point(r, tab, "from", "from_at").await?;
+            let (x2, y2, to) = point(r, tab, "to", "to_at").await?;
+            let steps = arg(r, "steps").as_u64().unwrap_or(12).clamp(1, 200);
+            mouse(tab, "mouseMoved", x1, y1).await?;
+            mouse_btn(tab, "mousePressed", x1, y1, "left", 1).await?;
+            for i in 1..=steps {
+                let f = i as f64 / steps as f64;
+                mouse_btn(tab, "mouseMoved", x1 + (x2 - x1) * f, y1 + (y2 - y1) * f, "left", 1).await?;
+            }
+            mouse_btn(tab, "mouseReleased", x2, y2, "left", 1).await?;
+            sleep(200).await;
+            Ok(json!(format!("dragged {from} to {to}")))
+        }
+        "wait_for" => {
+            let timeout = arg(r, "timeout_ms").as_f64().unwrap_or(15_000.0);
+            let (expr, what) = match (arg(r, "selector").as_str(), arg(r, "text").as_str()) {
+                (Some(sel), _) => (format!("!!document.querySelector({})", js_str(sel)), format!("`{sel}`")),
+                (None, Some(text)) => (
+                    format!("!!(document.body && document.body.innerText.includes({}))", js_str(text)),
+                    format!("\"{text}\""),
+                ),
+                _ => return Err("give a selector or --text".into()),
+            };
+            let gone = arg(r, "gone").as_bool().unwrap_or(false);
+            let end = now() + timeout;
+            loop {
+                let present = eval(tab, &expr).await.map(|v| v == Value::Bool(true)).unwrap_or(false);
+                if present != gone {
+                    return Ok(json!(format!("{what} {}", if gone { "is gone" } else { "is there" })));
+                }
+                if now() > end {
+                    return Err(format!("timed out waiting for {what}{}", if gone { " to go away" } else { "" }));
+                }
+                sleep(150).await;
+            }
+        }
+        "diff" => {
+            let tree = read_tree(tab, None, usize::MAX).await?.tree;
+            let before = with(|s| s.last_tree.insert(tab, tree.clone()));
+            let Some(before) = before else {
+                return Ok(json!("(first read of this tab; run diff again after the page changes)"));
+            };
+            // Refs are renumbered on every read, so compare lines without them.
+            let strip = |l: &str| match l.rfind(" [e") {
+                Some(i) if l.ends_with(']') => l[..i].to_string(),
+                _ => l.to_string(),
+            };
+            let old: Vec<String> = before.lines().map(strip).collect();
+            let new: Vec<String> = tree.lines().map(strip).collect();
+            let mut out = String::new();
+            for l in old.iter().filter(|l| !new.contains(l)) {
+                out.push_str(&format!("- {}\n", l.trim_start()));
+            }
+            for (l, raw) in new.iter().zip(tree.lines()) {
+                if !old.contains(l) {
+                    out.push_str(&format!("+ {}\n", raw.trim_start()));
+                }
+            }
+            Ok(json!(if out.is_empty() { "no changes".to_string() } else { out }))
+        }
+        "style" => match arg(r, "action").as_str().unwrap_or("add") {
+            "add" => {
+                let css = arg_str(r, "css")?;
+                let id = with(|s| {
+                    s.style_seq += 1;
+                    format!("s{}", s.style_seq)
+                });
+                eval(
+                    tab,
+                    &format!(
+                        "(() => {{ const s = document.createElement('style'); s.dataset.hrafn = {}; s.textContent = {}; document.documentElement.appendChild(s); }})()",
+                        js_str(&id),
+                        js_str(&css)
+                    ),
+                )
+                .await?;
+                Ok(json!(format!("added style {id} (remove with: hrafn style remove {id})")))
+            }
+            "remove" => {
+                let id = arg_str(r, "id")?;
+                let n = eval(tab, &format!("(() => {{ const s = document.querySelector('style[data-hrafn=' + JSON.stringify({}) + ']'); if (s) s.remove(); return !!s; }})()", js_str(&id))).await?;
+                if n == Value::Bool(true) { Ok(json!(format!("removed style {id}"))) } else { Err(format!("no style {id} on this page")) }
+            }
+            _ => {
+                let n = eval(tab, "(() => { const all = document.querySelectorAll('style[data-hrafn]'); all.forEach((s) => s.remove()); return all.length; })()").await?;
+                Ok(json!(format!("removed {n} style(s)")))
+            }
+        },
+        "headers" => {
+            attach(tab).await?;
+            let msg = with(|s| {
+                let h = s.headers.entry(tab).or_default();
+                match arg(r, "action").as_str().unwrap_or("list") {
+                    "add" => {
+                        let (Some(n), Some(v)) = (arg(r, "name").as_str(), arg(r, "value").as_str()) else {
+                            return Err("usage: headers add <name> <value>".to_string());
+                        };
+                        h.insert(n.to_string(), json!(v));
+                        Ok(format!("every request from this tab now sends {n}"))
+                    }
+                    "remove" => {
+                        let n = arg(r, "name").as_str().unwrap_or("");
+                        Ok(if h.remove(n).is_some() { format!("removed {n}") } else { format!("{n} was not set") })
+                    }
+                    "clear" => {
+                        h.clear();
+                        Ok("cleared extra headers".into())
+                    }
+                    _ => Ok(if h.is_empty() {
+                        "no extra headers".into()
+                    } else {
+                        h.iter().map(|(k, v)| format!("{k}: {}", v.as_str().unwrap_or(""))).collect::<Vec<_>>().join("\n")
+                    }),
+                }
+            })?;
+            apply_tab_settings(tab).await?;
+            Ok(json!(msg))
+        }
+        "override" => {
+            attach(tab).await?;
+            let msg = with(|s| {
+                let list = s.overrides.entry(tab).or_default();
+                match arg(r, "action").as_str().unwrap_or("list") {
+                    "add" => {
+                        let pattern = arg(r, "pattern").as_str().unwrap_or("").to_string();
+                        if pattern.is_empty() {
+                            return Err("give a URL pattern, e.g. '*/api/items*'".to_string());
+                        }
+                        list.retain(|o| o.pattern != pattern);
+                        list.push(Override {
+                            pattern: pattern.clone(),
+                            status: arg(r, "status").as_u64().unwrap_or(200) as u16,
+                            content_type: arg(r, "content_type").as_str().unwrap_or("application/json").to_string(),
+                            body: arg(r, "body").as_str().unwrap_or("").to_string(),
+                        });
+                        Ok(format!("requests matching {pattern} now get the fake response"))
+                    }
+                    "clear" => {
+                        list.clear();
+                        Ok("removed all overrides".into())
+                    }
+                    _ => Ok(if list.is_empty() {
+                        "no overrides".into()
+                    } else {
+                        list.iter().map(|o| format!("{}  -> {} {} ({} bytes)", o.pattern, o.status, o.content_type, o.body.len())).collect::<Vec<_>>().join("\n")
+                    }),
+                }
+            })?;
+            apply_tab_settings(tab).await?;
+            Ok(json!(msg))
+        }
+        "record" => match arg(r, "action").as_str().unwrap_or("status") {
+            "start" => {
+                attach(tab).await?;
+                let url = tab_info(tab).await?["url"].as_str().unwrap_or("").to_string();
+                with(|s| s.recordings.insert(tab, Recording { start_url: url.clone(), ..Default::default() }));
+                install_recorder(tab).await?;
+                Ok(json!(format!("recording tab {tab} from {url}; stop with: hrafn record stop [plan-file]")))
+            }
+            "stop" => {
+                let rec = with(|s| s.recordings.remove(&tab)).ok_or("this tab is not being recorded")?;
+                if let Some(id) = &rec.script_id {
+                    let _ = cdp_raw(tab, "Page.removeScriptToEvaluateOnNewDocument", json!({"identifier": id})).await;
+                }
+                let _ = cdp_raw(tab, "Runtime.removeBinding", json!({"name": "__hrafnRecord"})).await;
+                Ok(json!({"start_url": rec.start_url, "steps": rec.steps}))
+            }
+            _ => Ok(json!(match with(|s| s.recordings.get(&tab).map(|r| r.steps.len())) {
+                Some(n) => format!("recording tab {tab}: {n} step(s) so far"),
+                None => "not recording".to_string(),
+            })),
+        },
         "focus" => {
             let b = resolve(tab, &arg_str(r, "target")?).await?;
             cdp(tab, "DOM.focus", json!({"backendNodeId": b})).await?;
@@ -607,14 +959,25 @@ async fn page_command(r: &Request, tab: i64) -> Result<Value, String> {
             Ok(json!({"data": shot["data"]}))
         }
         "eval" => eval(tab, &arg_str(r, "code")?).await,
-        "console" | "net" => {
+        "net" if arg(r, "action") == "body" => {
+            let id = arg_str(r, "id")?;
+            let b = cdp(tab, "Network.getResponseBody", json!({"requestId": id}))
+                .await
+                .map_err(|e| format!("{e} (bodies are only kept for recent requests on an attached tab)"))?;
+            Ok(json!({"body": b["body"], "base64": b["base64Encoded"]}))
+        }
+        "console" | "net" | "sse" => {
             attach(tab).await?;
             let limit = arg(r, "limit").as_u64().unwrap_or(50) as usize;
             let filter = arg(r, "filter").as_str().map(str::to_lowercase);
             let clear = arg(r, "clear").as_bool().unwrap_or(false) || arg(r, "action") == "clear";
             Ok(with(|s| {
                 let log = s.logs.entry(tab).or_default();
-                let q = if r.cmd == "console" { &mut log.console } else { &mut log.net };
+                let q = match r.cmd.as_str() {
+                    "console" => &mut log.console,
+                    "sse" => &mut log.sse,
+                    _ => &mut log.net,
+                };
                 if clear {
                     q.clear();
                     return json!("cleared");

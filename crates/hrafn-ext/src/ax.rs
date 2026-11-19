@@ -81,6 +81,10 @@ fn walk(
         return;
     }
     let role = s(n, "role");
+    // Line-layout pieces of text the parent already shows: skip them and their children.
+    if role == "InlineTextBox" || role == "LineBreak" {
+        return;
+    }
     let name = clip(s(n, "name"));
     let ignored = n["ignored"].as_bool().unwrap_or(false);
     let wrapper = WRAPPERS.contains(&role) && name.is_empty();
@@ -174,6 +178,18 @@ mod tests {
         let r = render(&page(), None, 40);
         assert!(r.tree.ends_with("(truncated; use --max-chars or read <ref> for a part of the page)\n"));
         assert!(r.tree.starts_with("- RootWebArea"));
+    }
+
+    #[test]
+    fn inline_text_boxes_are_hidden() {
+        let nodes = vec![
+            node("1", None, "paragraph", "", &["2"], 1),
+            node("2", Some("1"), "StaticText", "Two lines of text", &["3", "4"], 2),
+            node("3", Some("2"), "InlineTextBox", "Two lines", &[], 3),
+            node("4", Some("2"), "InlineTextBox", "of text", &[], 4),
+        ];
+        let r = render(&nodes, None, 10_000);
+        assert_eq!(r.tree, "- paragraph [e1]\n  - text \"Two lines of text\"\n");
     }
 
     #[test]

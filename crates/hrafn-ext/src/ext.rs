@@ -264,7 +264,17 @@ async fn cdp_raw(tab: i64, method: &str, params: Value) -> Result<Value, String>
 
 async fn cdp(tab: i64, method: &str, params: Value) -> Result<Value, String> {
     attach(tab).await?;
-    cdp_raw(tab, method, params).await
+    match cdp_raw(tab, method, params.clone()).await {
+        // The browser can drop the debugger mid-command (e.g. while it first shows
+        // its "debugging" bar). Reattach once and retry.
+        Err(e) if e.contains("Detached") || e.contains("not attached") => {
+            with(|s| s.attached.remove(&tab));
+            sleep(200).await;
+            attach(tab).await?;
+            cdp_raw(tab, method, params).await
+        }
+        other => other,
+    }
 }
 
 async fn wait_load(tab: i64, timeout_ms: f64) -> Result<(), String> {

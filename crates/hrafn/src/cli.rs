@@ -71,6 +71,18 @@ Reading text from pixels (OCR, offline; models download once, ~12 MB)
   ocr --find TEXT              Where TEXT is on screen (X,Y)
   ocr --click TEXT             Click the visible TEXT (canvas, images, anything)
 
+Sites (use your own signed-in session in the browser)
+  chatgpt status | send <prompt> [--stream] [--timeout S] | read [--all]
+  chatgpt conversations | switch <id> | new | stop | model [name]
+                               Prompt `-` reads it from stdin
+  linkedin job|event|post|profile [url]   Read the LinkedIn page you have open
+  linkedin attendees [url] [--max N]      People listed for an event (default 100)
+  gdocs info | text | export <format> <file>
+                               Doc/Sheet/Slides text or a download (txt, md, pdf,
+                               docx, csv, xlsx, pptx, ...) via Google's own export
+  gdocs insert <text> [--end]  Type at the cursor (--end: at the end of the doc)
+  gdocs slides | slide <n> | notes        Slides: list, go to, speaker notes
+
 Page styling
   style add '<css>' | style remove <id> | style clear
 
@@ -122,6 +134,21 @@ pub fn run(mut args: Vec<String>) -> i32 {
         "doctor" => doctor(),
         "run" | "replay" => run_plan(rest, tab),
         "ocr" => ocr_cmd(rest.to_vec(), tab, raw_json),
+        "chatgpt" | "linkedin" | "gdocs" => {
+            let rpc = |c: &str, a: Value, t: Option<i64>| -> Result<Value, String> {
+                let r = call(c, a, t)?;
+                if r.ok { Ok(r.result) } else { Err(r.error.unwrap_or_else(|| "failed".into())) }
+            };
+            let res = match cmd.as_str() {
+                "chatgpt" => crate::sites::chatgpt(&rpc, tab, rest, raw_json),
+                "linkedin" => crate::sites::linkedin(&rpc, tab, rest, raw_json),
+                _ => crate::sites::gdocs(&rpc, tab, rest, raw_json),
+            };
+            match res {
+                Ok(()) => 0,
+                Err(e) => fail(e),
+            }
+        }
         "wait" => match rest.first().and_then(|m| m.parse::<u64>().ok()) {
             Some(ms) => {
                 std::thread::sleep(Duration::from_millis(ms));

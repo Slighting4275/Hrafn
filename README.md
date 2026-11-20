@@ -78,6 +78,32 @@ hrafn cookies <domain> | cookies set '<json>' | cookies delete <url> <name>
 hrafn detach | doctor | help
 ```
 
+### Sites: ChatGPT, LinkedIn, Google Docs
+
+These work in your own signed-in browser session and are built from the generic
+commands, so the sites see a normal browser. Their page structure changes often;
+each reader has several fallbacks, and an empty result says so instead of
+guessing.
+
+```
+hrafn chatgpt status | send <prompt> [--stream] [--timeout S] | read [--all]
+hrafn chatgpt conversations | switch <id> | new | stop | model [name]
+hrafn linkedin job|event|post|profile [url] | attendees [url] [--max N]
+hrafn gdocs info | text | export <format> <file> | insert <text> [--end]
+hrafn gdocs slides | slide <n> | notes
+```
+
+- `chatgpt send` types the prompt, submits it and waits until the answer has
+  finished and stopped changing (`--stream` prints it as it arrives; `-` reads
+  the prompt from stdin).
+- `linkedin` reads the page you have open (or opens the URL you give). It never
+  opens LinkedIn on its own. Automated use can break LinkedIn's terms; keep it to
+  pages you would read anyway. `attendees` stops at 100 people unless `--max`.
+- `gdocs text`/`export` use Google's own export links inside your session
+  (Docs: txt, md, pdf, docx, odt, rtf, html, epub; Sheets: csv, tsv, xlsx, ods,
+  pdf; Slides: txt, pdf, pptx, odp). Docs draws text on a canvas, so this is the
+  reliable way to read it; `hrafn ocr` reads what is on screen.
+
 ### Reading text from pixels (OCR)
 
 `hrafn ocr` reads the text that is actually drawn on screen, including text

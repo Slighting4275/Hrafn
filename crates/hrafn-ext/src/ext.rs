@@ -617,6 +617,10 @@ async fn dispatch(r: &Request) -> Result<Value, String> {
             Ok(json!(format!("stopped debugging tab {tab}")))
         }
         "cookies" => cookies(r).await,
+        "current_tab" => {
+            let tab = target_tab(r).await?;
+            tab_info(tab).await
+        }
         _ => {
             let tab = target_tab(r).await?;
             page_command(r, tab).await
@@ -908,6 +912,12 @@ async fn page_command(r: &Request, tab: i64) -> Result<Value, String> {
             }
             cdp(tab, "Input.insertText", json!({"text": text})).await?;
             Ok(json!(format!("typed {} characters into {target}", text.chars().count())))
+        }
+        "insert_text" => {
+            // Type at the page's current cursor/focus (no target element).
+            let text = arg_str(r, "text")?;
+            cdp(tab, "Input.insertText", json!({"text": text})).await?;
+            Ok(json!(format!("typed {} characters", text.chars().count())))
         }
         "select" => {
             let b = resolve(tab, &arg_str(r, "target")?).await?;

@@ -30,7 +30,74 @@ document.getElementById("dst").addEventListener("mouseup", () => { if (dragging)
 document.addEventListener("mouseup", () => { setTimeout(() => { dragging = false; }, 0); });
 </script></body></html>"#;
 
-const PAGE_TWO: &str = r#"<!doctype html><html><head><title>Page two</title></head><body><h1>Page two</h1></body></html>"#;
+/// Mock of ChatGPT's page structure: composer, send/stop buttons, streamed answer.
+const FAKE_CHATGPT: &str = r#"<!doctype html><html><head><title>ChatGPT</title></head><body>
+<nav><a href="/c/conv-one">First chat</a> <a href="/c/conv-two">Second chat</a></nav>
+<button data-testid="model-switcher-dropdown-button" onclick="document.getElementById('menu').hidden = false">Test-4</button>
+<div id="menu" role="menu" hidden><div role="menuitem" onclick="pick(this)">Test-5 mini</div><div role="menuitem" onclick="pick(this)">Test-5 pro</div></div>
+<main id="thread"></main>
+<form id="f"><div id="prompt-textarea" contenteditable="true" style="min-height:2em;border:1px solid #888"></div>
+<button data-testid="send-button" type="submit">Send</button></form>
+<script>
+function pick(el) { document.querySelector('[data-testid="model-switcher-dropdown-button"]').textContent = el.textContent; document.getElementById('menu').hidden = true; }
+document.getElementById('f').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const box = document.getElementById('prompt-textarea');
+  const prompt = box.textContent.trim(); box.textContent = '';
+  const thread = document.getElementById('thread');
+  const u = document.createElement('div'); u.setAttribute('data-message-author-role', 'user'); u.textContent = prompt; thread.appendChild(u);
+  const a = document.createElement('div'); a.setAttribute('data-message-author-role', 'assistant'); thread.appendChild(a);
+  const stop = document.createElement('button'); stop.setAttribute('data-testid', 'stop-button'); stop.textContent = 'Stop'; document.body.appendChild(stop);
+  const words = ('You said: ' + prompt + '. Ravens fly at dawn.').split(' ');
+  let i = 0;
+  const t = setInterval(() => { a.textContent += (i ? ' ' : '') + words[i++]; if (i >= words.length) { clearInterval(t); stop.remove(); } }, 80);
+  stop.onclick = () => { clearInterval(t); stop.remove(); };
+});
+</script></body></html>"#;
+
+const FAKE_LINKEDIN_JOB: &str = r#"<!doctype html><html><head><title>Warehouse Lead | Example Freight | LinkedIn</title></head><body>
+<h1 class="job-details-jobs-unified-top-card__job-title">Warehouse Lead</h1>
+<div class="job-details-jobs-unified-top-card__company-name"><a>Example Freight</a></div>
+<div class="job-details-jobs-unified-top-card__primary-description-container"><span class="tvm__text">Springfield, WA</span> · 3 days ago · 25 applicants</div>
+<button class="job-details-fit-level-preferences"><span>Full-time</span></button>
+<div class="jobs-description__content"><p>Lead a small warehouse team.</p><p>Forklift experience helps.</p></div>
+</body></html>"#;
+
+const FAKE_LINKEDIN_EVENT: &str = r#"<!doctype html><html><head><title>Raven Meetup | LinkedIn</title>
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"Event","name":"Raven Meetup","startDate":"2026-12-01T18:00","organizer":{"@type":"Organization","name":"Example Birders"},"location":{"@type":"VirtualLocation","url":"https://example.com/live"},"description":"An evening about corvids."}</script></head><body>
+<h1>Raven Meetup</h1><a id="att" href="javascript:void 0">12 attendees</a>
+<div id="dlg" role="dialog" hidden><div class="artdeco-modal__content" style="height:120px;overflow:auto"><ul id="people"></ul></div></div>
+<script>
+let n = 0;
+function more() { const ul = document.getElementById('people'); for (let k = 0; k < 4 && n < 12; k++, n++) {
+  const li = document.createElement('li'); li.innerHTML = '<a href="https://www.linkedin.com/in/person-' + n + '?mini=1">Person ' + n + '</a><div>Bird watcher ' + n + '</div><button>Connect</button>'; li.style.height = '40px'; ul.appendChild(li); } }
+document.getElementById('att').onclick = () => { document.getElementById('dlg').hidden = false; more(); };
+document.querySelector('.artdeco-modal__content').addEventListener('scroll', (e) => { const s = e.target; if (s.scrollTop + s.clientHeight >= s.scrollHeight - 5) more(); });
+</script></body></html>"#;
+
+const FAKE_LINKEDIN_POST: &str = r#"<!doctype html><html><head><title>Post | LinkedIn</title></head><body>
+<div class="feed-shared-update-v2"><div class="update-components-actor__title"><span aria-hidden="true">Example Person</span></div>
+<div class="update-components-actor__description"><span aria-hidden="true">Ornithologist</span></div>
+<div class="update-components-text">Ravens can count to seven.</div>
+<span class="social-details-social-counts__reactions-count">42</span><button class="social-details-social-counts__comments">5 comments</button></div>
+</body></html>"#;
+
+const FAKE_GOOGLE_DOC: &str = r#"<!doctype html><html><head><title>Test Doc - Google Docs</title></head><body>
+<div class="kix-appview-editor" contenteditable="true" style="min-height:4em;border:1px solid #888">Existing text.</div>
+</body></html>"#;
+
+const FAKE_GOOGLE_SHEET: &str = r#"<!doctype html><html><head><title>Test Sheet - Google Sheets</title></head><body><div>grid</div></body></html>"#;
+
+const FAKE_GOOGLE_SLIDES: &str = r##"<!doctype html><html><head><title>Test Deck - Google Slides</title></head><body>
+<svg width="200" height="260">
+  <g onclick="go(1)"><rect class="punch-filmstrip-thumbnail" x="0" y="0" width="200" height="120" fill="#ddd"></rect><text x="10" y="60">Opening slide</text></g>
+  <g onclick="go(2)"><rect class="punch-filmstrip-thumbnail" x="0" y="130" width="200" height="120" fill="#ddd"></rect><text x="10" y="190">Second slide</text></g>
+</svg>
+<div id="speakernotes">Notes for slide 1</div>
+<script>function go(n) { document.getElementById('speakernotes').textContent = 'Notes for slide ' + n; }</script>
+</body></html>"##;
+
+const PAGE_TWO: &str =r#"<!doctype html><html><head><title>Page two</title></head><body><h1>Page two</h1></body></html>"#;
 
 fn serve() -> String {
     let server = tiny_http::Server::http("127.0.0.1:0").expect("test server");
@@ -47,9 +114,25 @@ fn serve() -> String {
                 .find(|h| h.field.equiv("X-Hrafn-Test"))
                 .map(|h| h.value.as_str().to_string())
                 .unwrap_or_default();
-            let resp = match req.url() {
+            let full = req.url().to_string();
+            let (path, query) = full.split_once('?').unwrap_or((full.as_str(), ""));
+            let text = |b: &str, t: &str| {
+                tiny_http::Response::from_string(b).with_header(format!("Content-Type: {t}").parse::<tiny_http::Header>().unwrap())
+            };
+            let resp = match path {
                 "/" => html(PAGE_ONE),
                 "/two" => html(PAGE_TWO),
+                p if p == "/chatgpt" || p.starts_with("/c/") => html(FAKE_CHATGPT),
+                "/li/job" => html(FAKE_LINKEDIN_JOB),
+                "/li/event" => html(FAKE_LINKEDIN_EVENT),
+                "/li/post" => html(FAKE_LINKEDIN_POST),
+                "/document/d/TESTDOC/edit" => html(FAKE_GOOGLE_DOC),
+                "/spreadsheets/d/TESTSHEET/edit" => html(FAKE_GOOGLE_SHEET),
+                "/presentation/d/TESTDECK/edit" => html(FAKE_GOOGLE_SLIDES),
+                "/document/d/TESTDOC/export" if query == "format=txt" => text("\u{feff}Hello from the test doc\nSecond line\n", "text/plain"),
+                "/document/d/TESTDOC/export" if query == "format=pdf" => text("%PDF-1.4 test file", "application/pdf"),
+                "/spreadsheets/d/TESTSHEET/export" if query == "format=csv&gid=5" => text("a,b\n1,2\n", "text/csv"),
+                "/presentation/d/TESTDECK/export/txt" => text("Opening slide\nSecond slide\n", "text/plain"),
                 "/api/echo" => tiny_http::Response::from_string(format!(r#"{{"header":"{echo}"}}"#))
                     .with_header("Content-Type: application/json".parse::<tiny_http::Header>().unwrap()),
                 "/events" => tiny_http::Response::from_string("event: tick\ndata: one\n\ndata: two\n\n")
@@ -398,6 +481,79 @@ pub fn run(unsandboxed: bool) {
     c.check("tab new", &["tab", "new", &format!("{site}/two")], |o| o.contains("Page two"));
     c.check("tab close", &["tab", "close"], |o| o.contains("closed tab"));
     c.check("detach", &["detach"], |o| o.contains("stopped debugging"));
+
+    // ---- site adapters, against local mock-ups of each site's page structure
+    c.check("open mock ChatGPT", &["navigate", &format!("{site}/chatgpt")], |o| o.contains("ChatGPT"));
+    c.check("chatgpt status", &["chatgpt", "status"], |o| o.contains("signed in: yes") && o.contains("model: Test-4"));
+    c.check("chatgpt send", &["chatgpt", "send", "Hello", "raven"], |o| o.trim() == "You said: Hello raven. Ravens fly at dawn.");
+    c.check("chatgpt send --stream", &["chatgpt", "send", "--stream", "Second", "question"], |o| o.trim() == "You said: Second question. Ravens fly at dawn.");
+    c.check("chatgpt read", &["chatgpt", "read"], |o| o.trim() == "You said: Second question. Ravens fly at dawn.");
+    c.check("chatgpt read --all", &["chatgpt", "read", "--all"], |o| o.matches("--- user").count() == 2 && o.matches("--- assistant").count() == 2);
+    c.check("chatgpt conversations", &["chatgpt", "conversations"], |o| o.contains("conv-one  First chat") && o.contains("conv-two  Second chat"));
+    c.check("chatgpt model switch", &["chatgpt", "model", "pro"], |o| o.contains("model: Test-5 pro"));
+    let (ok, _, err) = c.h(&["chatgpt", "model", "turbo-ultra"]);
+    if !ok && err.contains("Test-5 mini") {
+        eprintln!("PASS chatgpt model lists choices when there is no match");
+    } else {
+        eprintln!("FAIL chatgpt model no-match: {err}");
+        c.failures.push("chatgpt model no match".into());
+    }
+    c.check("chatgpt switch", &["chatgpt", "switch", "conv-two"], |o| o.contains("conv-two"));
+    c.check("chatgpt switch landed", &["eval", "location.pathname"], |o| o.trim() == "/c/conv-two");
+
+    c.check("linkedin job", &["linkedin", "job", &format!("{site}/li/job")], |o| {
+        o.contains("title: Warehouse Lead") && o.contains("company: Example Freight") && o.contains("Springfield, WA") && o.contains("Lead a small warehouse team")
+    });
+    c.check("linkedin job --json", &["--json", "linkedin", "job"], |o| o.contains("\"title\": \"Warehouse Lead\""));
+    c.check("linkedin event", &["linkedin", "event", &format!("{site}/li/event")], |o| {
+        o.contains("title: Raven Meetup") && o.contains("organizer: Example Birders") && o.contains("attendees: 12 attendees") && o.contains("2026-12-01")
+    });
+    c.check("linkedin attendees --max", &["linkedin", "attendees", &format!("{site}/li/event"), "--max", "10"], |o| {
+        o.contains("(10 people)") && o.contains("Person 0 — Bird watcher 0  https://www.linkedin.com/in/person-0")
+    });
+    c.check("linkedin attendees (loads more by scrolling)", &["linkedin", "attendees", &format!("{site}/li/event")], |o| o.contains("(12 people)") && o.contains("Person 11"));
+    c.check("linkedin post", &["linkedin", "post", &format!("{site}/li/post")], |o| {
+        o.contains("author: Example Person") && o.contains("Ravens can count to seven") && o.contains("reactions: 42")
+    });
+
+    c.check("open mock Google Doc", &["navigate", &format!("{site}/document/d/TESTDOC/edit")], |o| o.contains("Test Doc"));
+    c.check("gdocs info", &["gdocs", "info"], |o| o.contains("document: Test Doc") && o.contains("id: TESTDOC"));
+    c.check("gdocs text", &["gdocs", "text"], |o| o.starts_with("Hello from the test doc\nSecond line"));
+    let pdf = work.join("doc.pdf");
+    let pdf_s = pdf.display().to_string();
+    c.check("gdocs export pdf", &["gdocs", "export", "pdf", &pdf_s], |o| o.contains("bytes"));
+    if std::fs::read(&pdf).unwrap_or_default().starts_with(b"%PDF") {
+        eprintln!("PASS exported file is the PDF");
+    } else {
+        eprintln!("FAIL exported PDF content");
+        c.failures.push("gdocs pdf".into());
+    }
+    let (ok, _, err) = c.h(&["gdocs", "export", "exe", &pdf_s]);
+    if !ok && err.contains("docx") {
+        eprintln!("PASS gdocs export lists formats for a bad one");
+    } else {
+        eprintln!("FAIL gdocs bad format: {err}");
+        c.failures.push("gdocs bad format".into());
+    }
+    c.check("gdocs insert --end", &["gdocs", "insert", " Added by hrafn.", "--end"], |o| o.contains("inserted"));
+    c.check("insert landed at the end", &["eval", "document.querySelector('.kix-appview-editor').textContent"], |o| o.trim() == "Existing text. Added by hrafn.");
+    c.check("open mock Sheet", &["navigate", &format!("{site}/spreadsheets/d/TESTSHEET/edit#gid=5")], |_| true);
+    c.check("gdocs text (sheet as CSV)", &["gdocs", "text"], |o| o.trim() == "a,b\n1,2");
+    c.check("open mock Slides", &["navigate", &format!("{site}/presentation/d/TESTDECK/edit")], |_| true);
+    c.check("gdocs slides", &["gdocs", "slides"], |o| o.contains("1  Opening slide") && o.contains("2  Second slide"));
+    c.check("gdocs notes", &["gdocs", "notes"], |o| o.trim() == "Notes for slide 1");
+    c.check("gdocs slide 2", &["gdocs", "slide", "2"], |o| o.contains("on slide 2"));
+    c.check("gdocs notes follow the slide", &["gdocs", "notes"], |o| o.trim() == "Notes for slide 2");
+    c.check("gdocs text (slides)", &["gdocs", "text"], |o| o.contains("Opening slide") && o.contains("Second slide"));
+    let (_, tabs_before, _) = c.h(&["tabs"]);
+    let (ok, _, err) = c.h(&["linkedin", "job"]);
+    let (_, tabs_after, _) = c.h(&["tabs"]);
+    if !ok && err.contains("no linkedin.com page is open") && tabs_before.lines().count() == tabs_after.lines().count() {
+        eprintln!("PASS linkedin without a LinkedIn page says so and opens nothing");
+    } else {
+        eprintln!("FAIL linkedin without a page: {err}");
+        c.failures.push("linkedin no page".into());
+    }
 
     let _ = brave.kill();
     let _ = brave.wait();

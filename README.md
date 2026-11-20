@@ -61,6 +61,7 @@ hrafn find <words> [--role ROLE] | html <target>
 hrafn click <target> [--double|--triple|--right] | click --at X,Y
 hrafn dblclick|rightclick|hover|focus <target> | drag <from> <to> [--steps N]
 hrafn type <target> <text> [--append] | select <target> <value>
+hrafn upload <file-input> <file>...   (files in a folder the browser can see, e.g. ~/Downloads)
 hrafn keys <combo> | scroll <up|down|top|bottom>
 hrafn wait <ms> | wait-stable [--ms N] [--timeout N]
 hrafn wait-for <selector> | wait-for --text TEXT  [--gone] [--timeout MS]

@@ -34,6 +34,8 @@ Acting (target = a ref like e12, or a CSS selector)
   drag <from> <to> [--steps N]   (or --from-at X,Y / --to-at X,Y)
   type <target> <text> [--append]
   select <target> <value>
+  upload <file-input> <file>... Attach files to an <input type=file> (files must
+                               be in a folder the browser can see, e.g. ~/Downloads)
   keys <combo>                 e.g. Enter, Tab, Escape, Control+A, Shift+ArrowDown
   scroll <up|down|top|bottom>
 
@@ -269,6 +271,15 @@ fn build(cmd: &str, rest: &[String]) -> Result<(String, Value), String> {
                 return Err("usage: hrafn drag <from> <to> (or --from-at X,Y / --to-at X,Y) [--steps N]".into());
             }
             out("drag", json!({ "from": from, "to": to, "from_at": from_at, "to_at": to_at, "steps": steps }))
+        }
+        "upload" => {
+            need(&r, 2, "upload <file-input target> <file>...")?;
+            let mut files = Vec::new();
+            for f in &r[1..] {
+                let p = std::fs::canonicalize(f).map_err(|e| format!("{f}: {e}"))?;
+                files.push(p.display().to_string());
+            }
+            out("upload", json!({ "target": r[0], "files": files }))
         }
         "focus" | "html" => {
             need(&r, 1, &format!("{cmd} <target>"))?;

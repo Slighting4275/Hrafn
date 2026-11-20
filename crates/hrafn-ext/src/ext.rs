@@ -913,6 +913,20 @@ async fn page_command(r: &Request, tab: i64) -> Result<Value, String> {
             cdp(tab, "Input.insertText", json!({"text": text})).await?;
             Ok(json!(format!("typed {} characters into {target}", text.chars().count())))
         }
+        "upload" => {
+            // Put files into an <input type=file> (the browser reads them itself, so
+            // they must be somewhere the browser, sandboxed or not, can see).
+            let target = arg_str(r, "target")?;
+            let files: Vec<String> = arg(r, "files").as_array().into_iter().flatten().filter_map(|f| f.as_str().map(String::from)).collect();
+            if files.is_empty() {
+                return Err("give at least one file".into());
+            }
+            let b = resolve(tab, &target).await?;
+            cdp(tab, "DOM.setFileInputFiles", json!({"files": files, "backendNodeId": b}))
+                .await
+                .map_err(|e| format!("{e} (is {target} an <input type=file>?)"))?;
+            Ok(json!(format!("attached {} file(s) to {target}", files.len())))
+        }
         "insert_text" => {
             // Type at the page's current cursor/focus (no target element).
             let text = arg_str(r, "text")?;

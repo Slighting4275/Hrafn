@@ -19,6 +19,7 @@ const PAGE_ONE: &str = r#"<!doctype html><html lang="en"><head><title>Hrafn test
 <div id="ctx" oncontextmenu="event.preventDefault(); this.textContent='right'">right me</div>
 <div id="src" style="width:80px;height:30px;background:#ccc">drag me</div>
 <div id="dst" style="width:120px;height:40px;background:#eee;margin-top:20px">drop here</div>
+<input type="file" id="files" multiple onchange="document.getElementById('picked').textContent = [...this.files].map((f) => f.name + ':' + f.size).join(',')"><span id="picked"></span>
 <button id="later-btn" onclick="setTimeout(() => { const p = document.createElement('p'); p.id = 'later'; p.textContent = 'Arrived late'; document.body.appendChild(p); }, 700)">Load later</button>
 <div style="height:3000px"></div><p id="bottom">Bottom of page</p>
 <script>
@@ -358,6 +359,11 @@ pub fn run(unsandboxed: bool) {
     let (_, at, _) = c.h(&["eval", "(() => { const r = document.getElementById('go').getBoundingClientRect(); return Math.round(r.x + r.width / 2) + ',' + Math.round(r.y + r.height / 2); })()"]);
     c.check("click at X,Y", &["click", "--at", at.trim()], |o| o.contains("clicked"));
     c.check("click at X,Y worked", &["eval", "document.getElementById('out').textContent"], |o| o.trim() == "clicked");
+    let up = work.join("upload-me.txt");
+    std::fs::write(&up, "raven feathers").unwrap();
+    let up_s = up.display().to_string();
+    c.check("upload a file", &["upload", "#files", &up_s], |o| o.contains("attached 1 file"));
+    c.check("upload reached the page", &["eval", "document.getElementById('picked').textContent"], |o| o.trim() == "upload-me.txt:14");
     c.check("diff baseline", &["diff"], |o| o.contains("first read"));
     c.check("start a late element", &["click", "#later-btn"], |_| true);
     c.check("wait-for selector", &["wait-for", "#later", "--timeout", "5000"], |o| o.contains("is there"));

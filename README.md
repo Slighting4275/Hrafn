@@ -72,9 +72,26 @@ hrafn headers [list] | headers add <name> <value> | headers remove <name> | head
 hrafn override [list] | override add <url-pattern> [--status N] [--type MIME]
                [--body TEXT | --file PATH] | override clear
 hrafn style add '<css>' | style remove <id> | style clear
+hrafn ocr [--target T] [--full] [--boxes] | ocr <image-file>
+hrafn ocr --find TEXT | ocr --click TEXT
 hrafn cookies <domain> | cookies set '<json>' | cookies delete <url> <name>
 hrafn detach | doctor | help
 ```
+
+### Reading text from pixels (OCR)
+
+`hrafn ocr` reads the text that is actually drawn on screen, including text
+inside images and canvas apps where the page has no readable text. It uses
+[ocrs](https://github.com/robertknight/ocrs), a pure-Rust OCR engine, so nothing
+leaves your computer. The two model files (about 12 MB) are downloaded once from
+the ocrs project into `~/.local/share/hrafn/models` and checked against pinned
+SHA-256 hashes; a damaged file is downloaded again.
+
+`--boxes` prints each line with its centre as `X,Y` (viewport coordinates, the
+same ones `click --at` takes). `--find TEXT` prints where TEXT is, and
+`--click TEXT` clicks it. Matching ignores case and spacing and allows about one
+misread character in five, because OCR output is never perfect.
+`hrafn ocr image.png` works on any image file without a browser.
 
 ### Recording and replay
 

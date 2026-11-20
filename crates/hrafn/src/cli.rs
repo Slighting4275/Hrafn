@@ -64,6 +64,13 @@ Logs, network and cookies
                                (pattern: * = anything, e.g. '*/api/items*')
   cookies <domain> | cookies set '<json>' | cookies delete <url> <name>
 
+Reading text from pixels (OCR, offline; models download once, ~12 MB)
+  ocr [--target T] [--full]    Text visible on the page (or one element)
+  ocr <image-file>             Text in an image file (no browser needed)
+  ocr --boxes                  Each line with its centre as X,Y (for click --at)
+  ocr --find TEXT              Where TEXT is on screen (X,Y)
+  ocr --click TEXT             Click the visible TEXT (canvas, images, anything)
+
 Page styling
   style add '<css>' | style remove <id> | style clear
 
@@ -114,6 +121,7 @@ pub fn run(mut args: Vec<String>) -> i32 {
         }
         "doctor" => doctor(),
         "run" | "replay" => run_plan(rest, tab),
+        "ocr" => ocr_cmd(rest.to_vec(), tab, raw_json),
         "wait" => match rest.first().and_then(|m| m.parse::<u64>().ok()) {
             Some(ms) => {
                 std::thread::sleep(Duration::from_millis(ms));
@@ -593,6 +601,98 @@ fn run_plan(rest: &[String], tab: Option<i64>) -> i32 {
     }
     println!("{passed} passed, {failed} failed");
     if failed == 0 { 0 } else { 1 }
+}
+
+/// `hrafn ocr`: read text from the page (or an image file) with the pure-Rust OCR engine.
+fn ocr_cmd(mut r: Vec<String>, tab: Option<i64>, raw_json: bool) -> i32 {
+    use crate::ocr;
+    let target = opt(&mut r, "--target");
+    let find_text = opt(&mut r, "--find");
+    let click_text = opt(&mut r, "--click");
+    let boxes = flag(&mut r, "--boxes");
+    let full = flag(&mut r, "--full");
+    if let Some(bad) = r.iter().find(|a| a.starts_with("--")) {
+        return fail(format!("unknown option {bad} (see `hrafn help`)"));
+    }
+    // An image file: no browser needed, positions are image pixels.
+    let (bytes, dpr, origin, from_file) = if let Some(file) = r.first() {
+        match std::fs::read(file) {
+            Ok(b) => (b, 1.0, (0.0, 0.0), true),
+            Err(e) => return fail(format!("could not read {file}: {e}")),
+        }
+    } else {
+        let resp = match call("screenshot", json!({ "target": target, "full": full }), tab) {
+            Ok(r) if r.ok => r.result,
+            Ok(r) => return fail(r.error.unwrap_or_default()),
+            Err(e) => return fail(e),
+        };
+        let data = resp["data"].as_str().unwrap_or("");
+        match base64::engine::general_purpose::STANDARD.decode(data) {
+            Ok(b) => (
+                b,
+                resp["dpr"].as_f64().unwrap_or(1.0),
+                (resp["origin"][0].as_f64().unwrap_or(0.0), resp["origin"][1].as_f64().unwrap_or(0.0)),
+                false,
+            ),
+            Err(e) => return fail(format!("bad image data: {e}")),
+        }
+    };
+    if click_text.is_some() && (from_file || full) {
+        return fail("--click works on the visible page only (not with an image file or --full)");
+    }
+    let lines = match ocr::recognize(&bytes) {
+        Ok(l) => l,
+        Err(e) => return fail(e),
+    };
+    let place = |b: [i32; 4]| {
+        let (cx, cy) = ocr::center(b);
+        let (x, y) = ocr::to_viewport(cx, cy, dpr, origin);
+        (x.round(), y.round())
+    };
+    if let Some(q) = find_text.as_ref().or(click_text.as_ref()) {
+        let Some((i, b)) = ocr::find(&lines, q) else {
+            let near = ocr::closest(&lines, q).map(|t| format!("; closest line read: \"{t}\"")).unwrap_or_default();
+            return fail(format!("\"{q}\" is not visible (OCR read {} line(s){near})", lines.len()));
+        };
+        let (x, y) = place(b);
+        if click_text.is_some() {
+            return match call("click", json!({ "at": [x, y], "count": 1, "button": "left" }), tab) {
+                Ok(r) if r.ok => {
+                    println!("clicked \"{q}\" at {x},{y} (line: {})", lines[i].text);
+                    0
+                }
+                Ok(r) => fail(r.error.unwrap_or_default()),
+                Err(e) => fail(e),
+            };
+        }
+        if raw_json {
+            println!("{}", json!({ "x": x, "y": y, "line": lines[i].text }));
+        } else {
+            println!("{x},{y}  {}", lines[i].text);
+        }
+        return 0;
+    }
+    if raw_json {
+        let out: Vec<Value> = lines
+            .iter()
+            .map(|l| {
+                let b = l.bounds();
+                let (x, y) = place(b);
+                json!({ "text": l.text, "x": x, "y": y, "box": b })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+    } else if boxes {
+        for l in &lines {
+            let (x, y) = place(l.bounds());
+            println!("{x},{y}  {}", l.text);
+        }
+    } else {
+        for l in &lines {
+            println!("{}", l.text);
+        }
+    }
+    0
 }
 
 fn save_screenshot(res: &Value, rest: &[String]) -> i32 {

@@ -5,6 +5,7 @@
 //! (older installs registered it that way).
 
 mod cli;
+mod ocr;
 mod plan;
 
 fn main() {

@@ -971,14 +971,36 @@ async fn page_command(r: &Request, tab: i64) -> Result<Value, String> {
             // A hidden tab never paints, so bring it to the front first.
             call(&["chrome", "tabs"], "update", vec![JsValue::from(tab as f64), to_js(&json!({"active": true}))]).await?;
             let mut p = json!({"format": "png"});
-            if arg(r, "full").as_bool().unwrap_or(false) {
+            // Where the image's top-left sits in the viewport (CSS px), so callers
+            // can turn image positions into click positions.
+            let (mut origin_x, mut origin_y) = (0.0, 0.0);
+            if let Some(target) = arg(r, "target").as_str() {
+                let b = resolve(tab, target).await?;
+                let _ = cdp(tab, "DOM.scrollIntoViewIfNeeded", json!({"backendNodeId": b})).await;
+                let q = cdp(tab, "DOM.getContentQuads", json!({"backendNodeId": b})).await?;
+                let quad: Vec<f64> = q["quads"][0].as_array().ok_or("element is not visible")?.iter().filter_map(Value::as_f64).collect();
+                if quad.len() != 8 {
+                    return Err("element is not visible".into());
+                }
+                let xs = [quad[0], quad[2], quad[4], quad[6]];
+                let ys = [quad[1], quad[3], quad[5], quad[7]];
+                let (x0, x1) = (xs.iter().cloned().fold(f64::MAX, f64::min), xs.iter().cloned().fold(f64::MIN, f64::max));
+                let (y0, y1) = (ys.iter().cloned().fold(f64::MAX, f64::min), ys.iter().cloned().fold(f64::MIN, f64::max));
+                // Clip coordinates are page coordinates: viewport position + scroll.
+                let scroll = eval(tab, "[window.scrollX, window.scrollY]").await?;
+                let (sx, sy) = (scroll[0].as_f64().unwrap_or(0.0), scroll[1].as_f64().unwrap_or(0.0));
+                p["captureBeyondViewport"] = json!(true);
+                p["clip"] = json!({"x": x0 + sx, "y": y0 + sy, "width": (x1 - x0).max(1.0), "height": (y1 - y0).max(1.0), "scale": 1});
+                (origin_x, origin_y) = (x0, y0);
+            } else if arg(r, "full").as_bool().unwrap_or(false) {
                 let m = cdp(tab, "Page.getLayoutMetrics", json!({})).await?;
                 let size = &m["cssContentSize"];
                 p["captureBeyondViewport"] = json!(true);
                 p["clip"] = json!({"x": 0, "y": 0, "width": size["width"], "height": size["height"], "scale": 1});
             }
             let shot = cdp(tab, "Page.captureScreenshot", p).await?;
-            Ok(json!({"data": shot["data"]}))
+            let dpr = eval(tab, "window.devicePixelRatio").await?.as_f64().unwrap_or(1.0);
+            Ok(json!({"data": shot["data"], "dpr": dpr, "origin": [origin_x, origin_y]}))
         }
         "eval" => eval(tab, &arg_str(r, "code")?).await,
         "net" if arg(r, "action") == "body" => {

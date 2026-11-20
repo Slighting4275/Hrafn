@@ -352,6 +352,25 @@ pub fn run(unsandboxed: bool) {
         eprintln!("FAIL full-page screenshot is not larger than the viewport one");
         c.failures.push("full screenshot".into());
     }
+    // ---- OCR (pure-Rust engine; models are downloaded once if missing)
+    c.check("scroll to top for OCR", &["scroll", "top"], |_| true);
+    c.check("ocr page", &["ocr"], |o| o.contains("Hrafn test") && o.contains("Press me"));
+    c.check("ocr --find", &["ocr", "--find", "Press me"], |o| o.split_whitespace().next().is_some_and(|xy| xy.contains(',')));
+    c.check("reset output", &["eval", "document.getElementById('out').textContent = 'waiting'"], |_| true);
+    c.check("ocr --click", &["ocr", "--click", "Press me"], |o| o.contains("clicked \"Press me\""));
+    c.check("ocr --click hit the button", &["eval", "document.getElementById('out').textContent"], |o| o.trim() == "clicked");
+    c.check("ocr one element", &["ocr", "--target", "h1"], |o| o.trim() == "Hrafn test");
+    c.check("scroll down for OCR", &["scroll", "bottom"], |_| true);
+    c.check("ocr element after scrolling", &["ocr", "--target", "#bottom"], |o| o.trim() == "Bottom of page");
+    c.check("ocr image file", &["ocr", &shot_s], |o| o.contains("Hrafn test"));
+    let (ok, _, err) = c.h(&["ocr", "--find", "no such words here"]);
+    if !ok && err.contains("is not visible") {
+        eprintln!("PASS ocr --find reports missing text");
+    } else {
+        eprintln!("FAIL ocr --find missing text: {err}");
+        c.failures.push("ocr find missing".into());
+    }
+
     c.check("navigate", &["navigate", &format!("{site}/two")], |o| o.contains("Page two"));
     let (ok, _, err) = c.h(&["click", &button_ref]);
     if !ok && err.contains("unknown ref") {

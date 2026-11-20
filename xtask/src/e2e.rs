@@ -30,24 +30,32 @@ document.getElementById("dst").addEventListener("mouseup", () => { if (dragging)
 document.addEventListener("mouseup", () => { setTimeout(() => { dragging = false; }, 0); });
 </script></body></html>"#;
 
-/// Mock of ChatGPT's page structure: composer, send/stop buttons, streamed answer.
+/// Mock of ChatGPT's late-2026 page structure, as seen on the real site: messages
+/// tagged `data-content-search-unit-key="<conv>:<n>:<role>"` with "… said:" labels,
+/// hidden duplicate model/Stop buttons, a visible Stop button only while
+/// answering, and no data-testid attributes.
 const FAKE_CHATGPT: &str = r#"<!doctype html><html><head><title>ChatGPT</title></head><body>
 <nav><a href="/c/conv-one">First chat</a> <a href="/c/conv-two">Second chat</a></nav>
-<button data-testid="model-switcher-dropdown-button" onclick="document.getElementById('menu').hidden = false">Test-4</button>
+<button aria-label="Select ChatGPT model" aria-haspopup="menu" style="display:none">Select effortTest-4HighLow</button>
+<button aria-label="Stop" style="display:none"></button>
+<button id="model" aria-label="Select ChatGPT model" aria-haspopup="menu" onclick="document.getElementById('menu').hidden = false">Test-4<br>High</button>
 <div id="menu" role="menu" hidden><div role="menuitem" onclick="pick(this)">Test-5 mini</div><div role="menuitem" onclick="pick(this)">Test-5 pro</div></div>
 <main id="thread"></main>
-<form id="f"><div id="prompt-textarea" contenteditable="true" style="min-height:2em;border:1px solid #888"></div>
-<button data-testid="send-button" type="submit">Send</button></form>
+<form id="f"><div id="prompt-textarea" contenteditable="true" style="min-height:2em;border:1px solid #888"></div></form>
 <script>
-function pick(el) { document.querySelector('[data-testid="model-switcher-dropdown-button"]').textContent = el.textContent; document.getElementById('menu').hidden = true; }
-document.getElementById('f').addEventListener('submit', (e) => {
+let n = 0;
+function pick(el) { document.getElementById('model').innerHTML = el.textContent + '<br>High'; document.getElementById('menu').hidden = true; }
+function unit(role, label) { const d = document.createElement('div'); d.setAttribute('data-content-search-unit-key', 'conv-x:' + (n++) + ':' + role);
+  const h = document.createElement('h5'); h.textContent = label; d.appendChild(h); const body = document.createElement('div'); d.appendChild(body);
+  document.getElementById('thread').appendChild(d); return body; }
+document.getElementById('prompt-textarea').addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter') return;
   e.preventDefault();
   const box = document.getElementById('prompt-textarea');
   const prompt = box.textContent.trim(); box.textContent = '';
-  const thread = document.getElementById('thread');
-  const u = document.createElement('div'); u.setAttribute('data-message-author-role', 'user'); u.textContent = prompt; thread.appendChild(u);
-  const a = document.createElement('div'); a.setAttribute('data-message-author-role', 'assistant'); thread.appendChild(a);
-  const stop = document.createElement('button'); stop.setAttribute('data-testid', 'stop-button'); stop.textContent = 'Stop'; document.body.appendChild(stop);
+  unit('user', 'You said:').textContent = prompt;
+  const a = unit('assistant', 'ChatGPT said:');
+  const stop = document.createElement('button'); stop.setAttribute('aria-label', 'Stop'); stop.textContent = '■'; document.body.appendChild(stop);
   const words = ('You said: ' + prompt + '. Ravens fly at dawn.').split(' ');
   let i = 0;
   const t = setInterval(() => { a.textContent += (i ? ' ' : '') + words[i++]; if (i >= words.length) { clearInterval(t); stop.remove(); } }, 80);
@@ -63,7 +71,18 @@ const FAKE_LINKEDIN_JOB: &str = r#"<!doctype html><html><head><title>Warehouse L
 <div class="jobs-description__content"><p>Lead a small warehouse team.</p><p>Forklift experience helps.</p></div>
 </body></html>"#;
 
-const FAKE_LINKEDIN_EVENT: &str = r#"<!doctype html><html><head><title>Raven Meetup | LinkedIn</title>
+/// Late-2026 LinkedIn job search page: scrambled class names, facts joined with
+/// " · ", an upsell line, and a long paragraph mentioning "Applicants".
+const FAKE_LINKEDIN_JOB_2026: &str = r#"<!doctype html><html><head><title>Parcel Courier | Example Parcel Co | LinkedIn</title></head><body>
+<h1 class="x9f2">0 notifications</h1>
+<ul class="a81kq"><li class="b2xx"><span>Selected, Parcel Courier</span><span class="zz1">Parcel Courier</span><div>Example Parcel Co</div><div>Springfield, WA</div></li></ul>
+<div class="p0q"><div class="r7t"><div><span class="k3j">Parcel Courier</span></div><div>Example Parcel Co</div>
+<div>Springfield, WA · 2 weeks ago · 19 people clicked apply</div><div>Full-time</div><div>Pay: $25.42/hr-$35.96/hr</div><div>Try Premium for $0</div></div>
+<section><h2>About the job</h2><p>Deliver parcels on a set route.</p><p>Applicants who need accommodations can ask at any time during the process, which is described in detail here for people who want it.</p></section>
+<section><h2>About the company</h2><p>Example Parcel Co moves boxes.</p></section></div>
+</body></html>"#;
+
+const FAKE_LINKEDIN_EVENT: &str =r#"<!doctype html><html><head><title>Raven Meetup | LinkedIn</title>
 <script type="application/ld+json">{"@context":"https://schema.org","@type":"Event","name":"Raven Meetup","startDate":"2026-12-01T18:00","organizer":{"@type":"Organization","name":"Example Birders"},"location":{"@type":"VirtualLocation","url":"https://example.com/live"},"description":"An evening about corvids."}</script></head><body>
 <h1>Raven Meetup</h1><a id="att" href="javascript:void 0">12 attendees</a>
 <div id="dlg" role="dialog" hidden><div class="artdeco-modal__content" style="height:120px;overflow:auto"><ul id="people"></ul></div></div>
@@ -124,6 +143,7 @@ fn serve() -> String {
                 "/two" => html(PAGE_TWO),
                 p if p == "/chatgpt" || p.starts_with("/c/") => html(FAKE_CHATGPT),
                 "/li/job" => html(FAKE_LINKEDIN_JOB),
+                "/li/job2026" => html(FAKE_LINKEDIN_JOB_2026),
                 "/li/event" => html(FAKE_LINKEDIN_EVENT),
                 "/li/post" => html(FAKE_LINKEDIN_POST),
                 "/document/d/TESTDOC/edit" => html(FAKE_GOOGLE_DOC),
@@ -505,6 +525,15 @@ pub fn run(unsandboxed: bool) {
         o.contains("title: Warehouse Lead") && o.contains("company: Example Freight") && o.contains("Springfield, WA") && o.contains("Lead a small warehouse team")
     });
     c.check("linkedin job --json", &["--json", "linkedin", "job"], |o| o.contains("\"title\": \"Warehouse Lead\""));
+    c.check("linkedin job (2026 scrambled markup)", &["--json", "linkedin", "job", &format!("{site}/li/job2026")], |o| {
+        let j: serde_json::Value = serde_json::from_str(o).unwrap_or_default();
+        j["title"] == "Parcel Courier"
+            && j["company"] == "Example Parcel Co"
+            && j["location"] == "Springfield, WA"
+            && j["summary"] == "Springfield, WA · 2 weeks ago · 19 people clicked apply"
+            && j["details"] == serde_json::json!(["Full-time", "Pay: $25.42/hr-$35.96/hr"])
+            && j["description"].as_str().is_some_and(|d| d.starts_with("Deliver parcels on a set route.") && !d.contains("Example Parcel Co moves"))
+    });
     c.check("linkedin event", &["linkedin", "event", &format!("{site}/li/event")], |o| {
         o.contains("title: Raven Meetup") && o.contains("organizer: Example Birders") && o.contains("attendees: 12 attendees") && o.contains("2026-12-01")
     });
@@ -545,6 +574,16 @@ pub fn run(unsandboxed: bool) {
     c.check("gdocs slide 2", &["gdocs", "slide", "2"], |o| o.contains("on slide 2"));
     c.check("gdocs notes follow the slide", &["gdocs", "notes"], |o| o.trim() == "Notes for slide 2");
     c.check("gdocs text (slides)", &["gdocs", "text"], |o| o.contains("Opening slide") && o.contains("Second slide"));
+    c.check("leave the Google pages", &["navigate", &format!("{site}/two")], |_| true);
+    let (_, tabs_before, _) = c.h(&["tabs"]);
+    let (ok, _, err) = c.h(&["gdocs", "info"]);
+    let (_, tabs_after, _) = c.h(&["tabs"]);
+    if !ok && err.contains("no docs.google.com page is open") && tabs_before.lines().count() == tabs_after.lines().count() {
+        eprintln!("PASS gdocs without a Google file says so and opens nothing");
+    } else {
+        eprintln!("FAIL gdocs without a file: {err}");
+        c.failures.push("gdocs no page".into());
+    }
     let (_, tabs_before, _) = c.h(&["tabs"]);
     let (ok, _, err) = c.h(&["linkedin", "job"]);
     let (_, tabs_after, _) = c.h(&["tabs"]);

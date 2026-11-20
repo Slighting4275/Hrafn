@@ -56,27 +56,69 @@ fn wait_for(rpc: Rpc, tab: i64, selector: &str, ms: u64) -> Result<(), String> {
 
 const CHATGPT_HOME: &str = "https://chatgpt.com/";
 const COMPOSER: &str = "#prompt-textarea, form [contenteditable='true'], form textarea";
-const LOOKS_LIKE_CHATGPT: &str = "document.querySelector('#prompt-textarea') && document.querySelector('[data-testid=\"send-button\"], [data-testid=\"composer-speech-button\"], form button[type=\"submit\"]')";
+const LOOKS_LIKE_CHATGPT: &str = "document.querySelector('#prompt-textarea') && document.querySelector('button[aria-label*=\"ChatGPT model\" i], [data-testid=\"model-switcher-dropdown-button\"], [data-content-search-unit-key], [data-message-author-role]')";
+
+/// Messages in either markup ChatGPT has used: `data-message-author-role` (older)
+/// and `data-content-search-unit-key="<conversation>:<n>:<role>"` (late 2026).
+/// Screen-reader labels ("ChatGPT said:", "You said:") are removed.
+const CHATGPT_MESSAGES: &str = r#"(() => {
+  const strip = (t) => t.replace(/^\s*(ChatGPT|You)\s+said:\s*/i, '').trim();
+  const old = [...document.querySelectorAll('[data-message-author-role]')]
+    .map((m) => ({ role: m.getAttribute('data-message-author-role'), text: strip(m.innerText) }));
+  if (old.length) return old;
+  return [...document.querySelectorAll('[data-content-search-unit-key]')]
+    .map((m) => ({ role: (m.getAttribute('data-content-search-unit-key').split(':').pop() || ''), text: strip(m.innerText) }))
+    .filter((m) => m.role === 'user' || m.role === 'assistant');
+})()"#;
+
+/// Selectors for ChatGPT's controls. The page keeps hidden copies of some
+/// buttons, so only *visible* matches count.
+const STOP_BUTTONS: &str = "[data-testid=\"stop-button\"], button[aria-label=\"Stop\" i], button[aria-label*=\"stop streaming\" i], button[aria-label*=\"stop generating\" i]";
+const MODEL_BUTTONS: &str = "[data-testid=\"model-switcher-dropdown-button\"], button[aria-label*=\"ChatGPT model\" i], button[aria-label*=\"Model selector\" i]";
 
 const CHATGPT_STATE: &str = r#"(() => {
-  const msgs = [...document.querySelectorAll('[data-message-author-role]')];
-  const last = [...msgs].reverse().find((m) => m.getAttribute('data-message-author-role') === 'assistant');
-  const stop = document.querySelector('[data-testid="stop-button"], button[aria-label*="Stop" i]');
-  const model = document.querySelector('[data-testid="model-switcher-dropdown-button"], button[aria-label*="Model" i]');
-  const login = document.querySelector('[data-testid="login-button"], a[href*="/auth/login"]');
+  const visible = (sel) => [...document.querySelectorAll(sel)].find((e) => e.getClientRects().length > 0);
+  const msgs = (MESSAGES);
+  const answers = msgs.filter((m) => m.role === 'assistant');
+  const stop = visible(STOP);
+  const model = visible(MODEL);
+  const login = visible('[data-testid="login-button"], a[href*="/auth/login"]');
   return {
-    assistant_count: msgs.filter((m) => m.getAttribute('data-message-author-role') === 'assistant').length,
-    last: last ? last.innerText : '',
+    assistant_count: answers.length,
+    last: answers.length ? answers[answers.length - 1].text : '',
     generating: !!stop,
-    model: model ? model.innerText.trim() : '',
+    model: model ? model.innerText.trim().split('\n')[0].trim() : '',
     logged_in: !login && !!document.querySelector('#prompt-textarea, form [contenteditable="true"], form textarea'),
     url: location.href,
     title: document.title,
   };
 })()"#;
 
+fn chatgpt_state_js() -> String {
+    CHATGPT_STATE
+        .replace("(MESSAGES)", CHATGPT_MESSAGES)
+        .replace("visible(STOP)", &format!("visible({})", js_str(STOP_BUTTONS)))
+        .replace("visible(MODEL)", &format!("visible({})", js_str(MODEL_BUTTONS)))
+}
+
+/// Click the first *visible* element matching `selectors` (by its on-screen centre).
+fn click_visible(rpc: Rpc, tab: i64, selectors: &str) -> Result<(), String> {
+    let xy = eval(
+        rpc,
+        Some(tab),
+        &format!(
+            "(() => {{ const e = [...document.querySelectorAll({})].find((x) => x.getClientRects().length > 0); if (!e) return null; e.scrollIntoView({{ block: 'center' }}); const r = e.getBoundingClientRect(); return [r.x + r.width / 2, r.y + r.height / 2]; }})()",
+            js_str(selectors)
+        ),
+    )?;
+    if xy.is_null() {
+        return Err("not visible".into());
+    }
+    rpc("click", json!({ "at": xy }), Some(tab)).map(|_| ())
+}
+
 fn chatgpt_state(rpc: Rpc, tab: i64) -> Result<Value, String> {
-    eval(rpc, Some(tab), CHATGPT_STATE)
+    eval(rpc, Some(tab), &chatgpt_state_js())
 }
 
 pub fn chatgpt(rpc: Rpc, tab: Option<i64>, args: &[String], raw_json: bool) -> Result<(), String> {
@@ -139,7 +181,7 @@ pub fn chatgpt(rpc: Rpc, tab: Option<i64>, args: &[String], raw_json: bool) -> R
         }
         "read" => {
             if rest.iter().any(|a| a == "--all") {
-                let all = eval(rpc, Some(tab), "[...document.querySelectorAll('[data-message-author-role]')].map((m) => ({ role: m.getAttribute('data-message-author-role'), text: m.innerText }))")?;
+                let all = eval(rpc, Some(tab), CHATGPT_MESSAGES)?;
                 if raw_json {
                     println!("{}", serde_json::to_string_pretty(&all).unwrap_or_default());
                 } else {
@@ -183,7 +225,7 @@ pub fn chatgpt(rpc: Rpc, tab: Option<i64>, args: &[String], raw_json: bool) -> R
             Ok(())
         }
         "stop" => {
-            rpc("click", json!({ "target": "[data-testid=\"stop-button\"]" }), Some(tab)).map_err(|_| "ChatGPT is not answering right now".to_string())?;
+            click_visible(rpc, tab, STOP_BUTTONS).map_err(|_| "ChatGPT is not answering right now".to_string())?;
             println!("stopped");
             Ok(())
         }
@@ -193,8 +235,7 @@ pub fn chatgpt(rpc: Rpc, tab: Option<i64>, args: &[String], raw_json: bool) -> R
                 return Ok(());
             }
             let name = rest.join(" ");
-            rpc("click", json!({ "target": "[data-testid=\"model-switcher-dropdown-button\"]" }), Some(tab))
-                .map_err(|_| "could not find the model menu on this page".to_string())?;
+            click_visible(rpc, tab, MODEL_BUTTONS).map_err(|_| "could not find the model menu on this page".to_string())?;
             std::thread::sleep(Duration::from_millis(500));
             let picked = eval(
                 rpc,
@@ -231,7 +272,7 @@ fn chatgpt_send(rpc: Rpc, tab: i64, prompt: &str, stream: bool, timeout: Duratio
     rpc("type", json!({ "target": "#prompt-textarea", "text": prompt }), Some(tab))
         .or_else(|_| rpc("type", json!({ "target": COMPOSER, "text": prompt }), Some(tab)))?;
     std::thread::sleep(Duration::from_millis(300));
-    if rpc("click", json!({ "target": "[data-testid=\"send-button\"]" }), Some(tab)).is_err() {
+    if click_visible(rpc, tab, "[data-testid=\"send-button\"], button[aria-label=\"Send prompt\" i], button[aria-label*=\"Send message\" i]").is_err() {
         rpc("keys", json!({ "combo": "Enter" }), Some(tab))?;
     }
     // Wait for a new answer, then for it to finish and stop changing.
@@ -283,13 +324,38 @@ const LINKEDIN_JOB: &str = r#"(() => {
   const tmp = document.createElement('div');
   const strip = (h) => { tmp.innerHTML = h || ''; return tmp.innerText.trim(); };
   const insights = [...document.querySelectorAll('.job-details-jobs-unified-top-card__job-insight, .job-details-preferences-and-skills__pill, .job-details-fit-level-preferences button')].map((e) => e.innerText.trim().replace(/\s+/g, ' ')).filter(Boolean);
+  // Markup-independent reading (LinkedIn's late-2026 job pages use scrambled class
+  // names): the tab title is "Job | Company | LinkedIn", the text around the job
+  // title on screen holds location/age/applicants, and "About the job" heads the
+  // description.
+  const parts = document.title.split(' | ');
+  const gTitle = parts.length >= 3 ? parts[0].trim() : '';
+  const gCompany = parts.length >= 3 ? parts[1].trim() : '';
+  let lines = [];
+  if (gTitle) {
+    const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT); let n; const hits = [];
+    while ((n = w.nextNode())) if (n.nodeValue.trim() === gTitle && n.parentElement.getClientRects().length) hits.push(n.parentElement);
+    const hit = hits[hits.length - 1];
+    if (hit) { let card = hit; for (let i = 0; i < 8 && card.parentElement && card.innerText.length < 300; i++) card = card.parentElement;
+      lines = card.innerText.split('\n').map((s) => s.trim()).filter((s) => s && s !== '·' && !/^selected,/i.test(s)); }
+  }
+  const about = [...document.querySelectorAll('h1, h2, h3')].find((h) => /^about the job$/i.test(h.innerText.trim()));
+  // The largest block around "About the job" that holds no other visible heading.
+  const headings = (e) => [...e.querySelectorAll('h1, h2, h3')].filter((h) => h.getClientRects().length > 0).length;
+  let sec = about; while (sec && sec.parentElement && headings(sec.parentElement) <= 1) sec = sec.parentElement;
+  const gDescription = sec ? sec.innerText.replace(/^\s*About the job\s*/i, '').trim() : '';
+  // Short facts, split at LinkedIn's " · " separators ("Seattle, WA · 2 weeks ago · 19 people clicked apply").
+  const facts = [...new Set(lines.filter((l) => l.length < 90).flatMap((l) => l.split(/\s+·\s+/)).map((s) => s.trim()).filter(Boolean))];
+  const gLocation = facts.find((l) => l !== gTitle && l !== gCompany && /,\s*[A-Z]{2}\b|\bremote\b|\bhybrid\b|on-site|united states/i.test(l)) || '';
+  const gSummary = [gLocation, facts.find((l) => /\bago\b|posted|reposted/i.test(l)), facts.find((l) => /applicant|clicked apply/i.test(l))].filter(Boolean).join(' · ');
+  const gDetails = facts.filter((l) => l !== gLocation && l !== gTitle && !/premium/i.test(l) && /full-time|part-time|contract|temporary|internship|\bremote\b|hybrid|on-site|\$\d/i.test(l));
   return {
-    title: t('.job-details-jobs-unified-top-card__job-title || .top-card-layout__title || .jobs-unified-top-card__job-title || h1') || (ld && ld.title) || '',
-    company: t('.job-details-jobs-unified-top-card__company-name || .topcard__org-name-link || .jobs-unified-top-card__company-name') || (ld && ld.hiringOrganization && ld.hiringOrganization.name) || '',
-    location: t('.job-details-jobs-unified-top-card__primary-description-container .tvm__text || .topcard__flavor--bullet || .jobs-unified-top-card__bullet') || (ld && ld.jobLocation && [].concat(ld.jobLocation)[0]?.address?.addressLocality) || '',
-    summary: t('.job-details-jobs-unified-top-card__primary-description-container || .jobs-unified-top-card__primary-description'),
-    details: insights,
-    description: t('.jobs-description__content || #job-details || .description__text || .show-more-less-html__markup') || (ld ? strip(ld.description) : ''),
+    title: t('.job-details-jobs-unified-top-card__job-title || .top-card-layout__title || .jobs-unified-top-card__job-title') || (ld && ld.title) || gTitle,
+    company: t('.job-details-jobs-unified-top-card__company-name || .topcard__org-name-link || .jobs-unified-top-card__company-name') || (ld && ld.hiringOrganization && ld.hiringOrganization.name) || gCompany,
+    location: t('.job-details-jobs-unified-top-card__primary-description-container .tvm__text || .topcard__flavor--bullet || .jobs-unified-top-card__bullet') || (ld && ld.jobLocation && [].concat(ld.jobLocation)[0]?.address?.addressLocality) || gLocation,
+    summary: t('.job-details-jobs-unified-top-card__primary-description-container || .jobs-unified-top-card__primary-description') || gSummary,
+    details: insights.length ? insights : gDetails,
+    description: t('.jobs-description__content || #job-details || .description__text || .show-more-less-html__markup') || (ld ? strip(ld.description) : '') || gDescription,
     url: location.href,
   };
 })()"#;
@@ -488,7 +554,8 @@ const SLIDE_NOTES: &str = r#"(() => { const n = document.querySelector('#speaker
 pub fn gdocs(rpc: Rpc, tab: Option<i64>, args: &[String], raw_json: bool) -> Result<(), String> {
     let sub = args.first().map(String::as_str).unwrap_or("info");
     let rest = &args[args.len().min(1)..];
-    let tab = site_tab(rpc, tab, "docs.google.com", "https://docs.google.com/", "/\\/(document|spreadsheets|presentation)\\/(u\\/\\d+\\/)?d\\//.test(location.pathname)")?;
+    // Never opens Google Docs by itself: it works on a file you already have open.
+    let tab = site_tab(rpc, tab, "docs.google.com", "", "/\\/(document|spreadsheets|presentation)\\/(u\\/\\d+\\/)?d\\//.test(location.pathname)")?;
     let page = eval(rpc, Some(tab), "({ url: location.href, origin: location.origin, title: document.title })")?;
     let url = page["url"].as_str().unwrap_or("");
     let origin = page["origin"].as_str().unwrap_or("https://docs.google.com");

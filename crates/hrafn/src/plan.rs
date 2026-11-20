@@ -10,8 +10,9 @@
 
 use serde_json::Value;
 
-/// Split one line into words. Double quotes group words; inside them `\"` and `\\`
-/// are escapes. Returns `None` for blank lines and comments.
+/// Split one line into words. Double quotes group words; inside them `\"`, `\\`,
+/// `\n`, `\r` and `\t` are escapes (so multi-line text fits on one plan line).
+/// Returns `None` for blank lines and comments.
 pub fn split(line: &str) -> Result<Option<Vec<String>>, String> {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') {
@@ -29,6 +30,9 @@ pub fn split(line: &str) -> Result<Option<Vec<String>>, String> {
                     match chars.next() {
                         Some('"') => break,
                         Some('\\') => match chars.next() {
+                            Some('n') => cur.push('\n'),
+                            Some('r') => cur.push('\r'),
+                            Some('t') => cur.push('\t'),
                             Some(e) => cur.push(e),
                             None => return Err("unfinished escape".into()),
                         },
@@ -60,7 +64,20 @@ pub fn quote(w: &str) -> String {
     if !w.is_empty() && w.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:+=,@#".contains(c)) {
         return w.to_string();
     }
-    format!("\"{}\"", w.replace('\\', "\\\\").replace('"', "\\\""))
+    let mut out = String::with_capacity(w.len() + 2);
+    out.push('"');
+    for c in w.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Turn recorded steps (from the extension) into plan lines.
@@ -77,7 +94,11 @@ pub fn from_steps(start_url: &str, steps: &[Value]) -> String {
             "type" if !target.is_empty() => format!("type {} {}", quote(target), quote(s["text"].as_str().unwrap_or(""))),
             "select" if !target.is_empty() => format!("select {} {}", quote(target), quote(s["value"].as_str().unwrap_or(""))),
             "keys" => format!("keys {}", quote(s["combo"].as_str().unwrap_or("Enter"))),
-            "navigate" => format!("# page changed to {}", s["url"].as_str().unwrap_or("")),
+            // A comment must stay on one line whatever the page reported.
+            "navigate" => format!(
+                "# page changed to {}",
+                s["url"].as_str().unwrap_or("").chars().map(|c| if c.is_control() { ' ' } else { c }).collect::<String>()
+            ),
             _ => continue,
         };
         out.push_str(&line);
@@ -104,7 +125,7 @@ mod tests {
 
     #[test]
     fn quote_round_trips() {
-        for w in ["#go", "Test User", "a \"b\" \\c", "", "https://x.test/a?b=c"] {
+        for w in ["#go", "Test User", "a \"b\" \\c", "", "https://x.test/a?b=c", "two\nlines\tand\r\n", "back\\nslash"] {
             let line = format!("cmd {}", quote(w));
             assert_eq!(split(&line).unwrap().unwrap()[1], w, "word {w:?}");
         }

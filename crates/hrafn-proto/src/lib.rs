@@ -6,6 +6,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Random-input test helpers (public so every crate's tests can use them).
+#[doc(hidden)]
+pub mod fuzz;
+
 /// Name Brave/Chrome use to find the native host manifest.
 pub const HOST_NAME: &str = "com.hrafn.host";
 

@@ -18,3 +18,6 @@ fn main() {
     };
     std::process::exit(code);
 }
+
+#[cfg(test)]
+mod fuzz_tests;

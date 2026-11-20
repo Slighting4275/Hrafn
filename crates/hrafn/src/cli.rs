@@ -205,6 +205,11 @@ fn need(rest: &[String], n: usize, usage: &str) -> Result<(), String> {
 }
 
 /// Turn a command line into the extension command name and its arguments.
+#[cfg(test)]
+pub fn build_for_tests(cmd: &str, rest: &[String]) -> Result<(String, Value), String> {
+    build(cmd, rest)
+}
+
 fn build(cmd: &str, rest: &[String]) -> Result<(String, Value), String> {
     let mut r: Vec<String> = rest.to_vec();
     let out = |name: &str, a: Value| Ok((name.to_string(), a));

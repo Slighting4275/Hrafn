@@ -2,7 +2,7 @@
 //! indented outline and hand out short refs (`e1`, `e2`...) for elements.
 
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Roles that are only layout wrappers: not printed, their children are.
 const WRAPPERS: [&str; 6] = ["generic", "none", "InlineTextBox", "LineBreak", "presentation", "Section"];
@@ -48,8 +48,12 @@ fn props(n: &Value) -> String {
     if out.is_empty() { String::new() } else { format!(" ({})", out.join(", ")) }
 }
 
+/// How many nodes deep the walk may recurse. The extension runs as WebAssembly with
+/// a small stack, so a pathologically deep page must not overflow it.
+const MAX_NESTING: usize = 256;
+
 /// `root_backend`: start from the node with this backend id instead of the page root.
-/// `ref_start`: first ref number to hand out (refs stay unique within one read).
+/// Refs are numbered from `e1` in each read.
 pub fn render(nodes: &[Value], root_backend: Option<i64>, max_chars: usize) -> Rendered {
     let by_id: HashMap<&str, &Value> =
         nodes.iter().filter_map(|n| n["nodeId"].as_str().map(|id| (id, n))).collect();
@@ -57,73 +61,102 @@ pub fn render(nodes: &[Value], root_backend: Option<i64>, max_chars: usize) -> R
         Some(b) => nodes.iter().find(|n| n["backendDOMNodeId"].as_i64() == Some(b)),
         None => nodes.iter().find(|n| n.get("parentId").is_none()).or(nodes.first()),
     };
-    let mut r = Rendered { tree: String::new(), refs: HashMap::new(), items: Vec::new() };
-    let mut truncated = false;
+    let mut w = Walk {
+        by_id: &by_id,
+        max: max_chars,
+        out: Rendered { tree: String::new(), refs: HashMap::new(), items: Vec::new() },
+        truncated: false,
+        too_deep: false,
+        seen: HashSet::new(),
+    };
     if let Some(root) = root {
-        walk(root, &by_id, 0, "", &mut r, max_chars, &mut truncated);
+        w.walk(root, 0, 0, "");
     }
-    if truncated {
+    let mut r = w.out;
+    if w.truncated {
         r.tree.push_str("… (truncated; use --max-chars or read <ref> for a part of the page)\n");
+    }
+    if w.too_deep {
+        r.tree.push_str("… (very deeply nested parts not shown; use read <ref> on a deeper element)\n");
     }
     r
 }
 
-fn walk(
-    n: &Value,
-    by_id: &HashMap<&str, &Value>,
-    depth: usize,
-    parent_name: &str,
-    r: &mut Rendered,
+struct Walk<'a> {
+    by_id: &'a HashMap<&'a str, &'a Value>,
     max: usize,
-    truncated: &mut bool,
-) {
-    if *truncated {
-        return;
-    }
-    let role = s(n, "role");
-    // Line-layout pieces of text the parent already shows: skip them and their children.
-    if role == "InlineTextBox" || role == "LineBreak" {
-        return;
-    }
-    let name = clip(s(n, "name"));
-    let ignored = n["ignored"].as_bool().unwrap_or(false);
-    let wrapper = WRAPPERS.contains(&role) && name.is_empty();
-    // Text that only repeats its parent's name ("link Docs" > "text Docs") adds noise.
-    let echo = role == "StaticText" && name == parent_name;
-    let print = !ignored && !wrapper && !echo && !(role == "StaticText" && name.is_empty());
+    out: Rendered,
+    truncated: bool,
+    too_deep: bool,
+    /// Nodes already visited: a malformed tree with a cycle must not loop forever.
+    seen: HashSet<&'a str>,
+}
 
-    let mut child_depth = depth;
-    let mut my_name = parent_name.to_string();
-    if print {
-        let indent = "  ".repeat(depth);
-        let line = if role == "StaticText" {
-            format!("{indent}- text \"{name}\"\n")
-        } else {
-            let mut line = format!("{indent}- {role}");
-            if !name.is_empty() {
-                line.push_str(&format!(" \"{name}\""));
+impl<'a> Walk<'a> {
+    fn walk(&mut self, n: &'a Value, depth: usize, nesting: usize, parent_name: &str) {
+        if self.truncated {
+            return;
+        }
+        if nesting > MAX_NESTING {
+            self.too_deep = true;
+            return;
+        }
+        if let Some(id) = n["nodeId"].as_str()
+            && !self.seen.insert(id)
+        {
+            return;
+        }
+        let role = s(n, "role");
+        // Line-layout pieces of text the parent already shows: skip them and their children.
+        if role == "InlineTextBox" || role == "LineBreak" {
+            return;
+        }
+        let name = clip(s(n, "name"));
+        let ignored = n["ignored"].as_bool().unwrap_or(false);
+        let wrapper = WRAPPERS.contains(&role) && name.is_empty();
+        // Text that only repeats its parent's name ("link Docs" > "text Docs") adds noise.
+        let echo = role == "StaticText" && name == parent_name;
+        let print = !ignored && !wrapper && !echo && !(role == "StaticText" && name.is_empty());
+
+        let mut child_depth = depth;
+        let mut my_name = parent_name.to_string();
+        if print {
+            let r = &mut self.out;
+            let indent = "  ".repeat(depth);
+            let backend = n["backendDOMNodeId"].as_i64().filter(|_| role != "StaticText");
+            let rf = backend.map(|_| format!("e{}", r.refs.len() + 1));
+            let line = if role == "StaticText" {
+                format!("{indent}- text \"{name}\"\n")
+            } else {
+                let mut line = format!("{indent}- {role}");
+                if !name.is_empty() {
+                    line.push_str(&format!(" \"{name}\""));
+                }
+                line.push_str(&props(n));
+                if let Some(rf) = &rf {
+                    line.push_str(&format!(" [{rf}]"));
+                }
+                line.push('\n');
+                line
+            };
+            if r.tree.len() + line.len() > self.max {
+                self.truncated = true;
+                return;
             }
-            line.push_str(&props(n));
-            if let Some(b) = n["backendDOMNodeId"].as_i64() {
-                let rf = format!("e{}", r.refs.len() + 1);
-                line.push_str(&format!(" [{rf}]"));
+            // Only lines that are actually shown get a ref.
+            if let (Some(rf), Some(b)) = (rf, backend) {
                 r.refs.insert(rf.clone(), b);
                 r.items.push((rf, role.to_string(), name.clone()));
             }
-            line.push('\n');
-            line
-        };
-        if r.tree.len() + line.len() > max {
-            *truncated = true;
-            return;
+            r.tree.push_str(&line);
+            child_depth = depth + 1;
+            my_name = name;
         }
-        r.tree.push_str(&line);
-        child_depth = depth + 1;
-        my_name = name;
-    }
-    for c in n["childIds"].as_array().into_iter().flatten() {
-        if let Some(child) = c.as_str().and_then(|id| by_id.get(id)) {
-            walk(child, by_id, child_depth, &my_name, r, max, truncated);
+        let by_id = self.by_id;
+        for c in n["childIds"].as_array().into_iter().flatten() {
+            if let Some(child) = c.as_str().and_then(|id| by_id.get(id)) {
+                self.walk(child, child_depth, nesting + 1, &my_name);
+            }
         }
     }
 }

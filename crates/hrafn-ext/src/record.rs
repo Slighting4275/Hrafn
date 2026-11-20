@@ -7,18 +7,20 @@ use serde_json::Value;
 /// dropped (typing focuses the field anyway on replay).
 pub fn record_step(steps: &mut Vec<Value>, step: Value) {
     if step["type"] == "type" {
+        // First drop a click into the same field, then merge with typing before it
+        // (type, click to move the cursor, type more = one step).
+        if let Some(last) = steps.last()
+            && last["type"] == "click"
+            && last["target"] == step["target"]
+        {
+            steps.pop();
+        }
         if let Some(last) = steps.last_mut()
             && last["type"] == "type"
             && last["target"] == step["target"]
         {
             *last = step;
             return;
-        }
-        if let Some(last) = steps.last()
-            && last["type"] == "click"
-            && last["target"] == step["target"]
-        {
-            steps.pop();
         }
     }
     // A double-click also fires two clicks first; keep only the double-click.
@@ -61,6 +63,16 @@ mod tests {
                 json!({"type": "type", "target": "#q", "text": "again"}),
             ]
         );
+    }
+
+    #[test]
+    fn type_click_type_in_one_field_is_one_step() {
+        let steps = run(&[
+            json!({"type": "type", "target": "#q", "text": "rav"}),
+            json!({"type": "click", "target": "#q"}),
+            json!({"type": "type", "target": "#q", "text": "ravens"}),
+        ]);
+        assert_eq!(steps, vec![json!({"type": "type", "target": "#q", "text": "ravens"})]);
     }
 
     #[test]

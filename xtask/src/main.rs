@@ -28,19 +28,20 @@ fn run(cmd: &mut Command) {
     assert!(status.success(), "command failed: {cmd:?}");
 }
 
-/// The extension's public key (fixes its ID). Created once and kept in the repo;
-/// the private half is thrown away because unpacked extensions don't need it.
+/// The extension's public key (fixes its ID, which the native host files allow).
+/// It was generated once and lives in the repo; unpacked extensions never need the
+/// private half. Changing it would change the extension ID, so a missing key is an
+/// error rather than something to regenerate quietly.
 fn public_key() -> String {
     let path = root().join("extension/key.pub.b64");
-    if let Ok(k) = std::fs::read_to_string(&path) {
-        return k.trim().to_string();
+    match std::fs::read_to_string(&path) {
+        Ok(k) if !k.trim().is_empty() => k.trim().to_string(),
+        _ => panic!(
+            "{} is missing. Restore it from git (git checkout extension/key.pub.b64); \
+             a new key would give the extension a new ID.",
+            path.display()
+        ),
     }
-    use rsa::pkcs8::EncodePublicKey;
-    let private = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).expect("RSA key");
-    let der = rsa::RsaPublicKey::from(&private).to_public_key_der().expect("DER");
-    let b64 = base64::engine::general_purpose::STANDARD.encode(der.as_bytes());
-    std::fs::write(&path, format!("{b64}\n")).expect("write key");
-    b64
 }
 
 /// Chrome's extension ID: first 128 bits of SHA-256(public key), hex digits 0-f as a-p.

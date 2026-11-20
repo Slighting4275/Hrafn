@@ -18,3 +18,6 @@ mod ext;
 
 #[cfg(target_arch = "wasm32")]
 pub use ext::start;
+
+#[cfg(test)]
+mod fuzz_tests;

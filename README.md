@@ -27,6 +27,9 @@ still read the web page's text and use CSS selectors for HTML, click, focus,
 type, select, and wait-for. These actions work in the main page. Fallback clicks
 and input events are synthetic. Accessibility refs, arbitrary JavaScript, and
 network inspection still need the debugger.
+If the debugger drops a reply during a click, Hrafn can confirm a matching
+browser click in the main page. An unconfirmed click should be checked before
+repeating the command.
 
 ### Sandboxed browsers (firejail)
 
@@ -132,8 +135,11 @@ Enter/Tab/Escape presses on the current tab. `hrafn record stop flow.txt` saves
 them as a plan: one hrafn command per line, editable, `#` for comments.
 `hrafn run flow.txt` replays it, waiting for the page to settle after each
 step, and prints ok/FAIL per line (it stops at the first failure unless
-`--keep-going`). Hand-written plans accept literal single-quoted arguments and
-double-quoted arguments with escapes. `hrafn run - --quiet` reads a plan from
+`--keep-going`). On tabs with a blocked debugger, it waits for the main page to
+load and its DOM to stop changing. Use `wait-for` when the next step needs a
+specific result. Hand-written plans accept matching single quotes at argument
+boundaries and double quotes with escapes. Bare apostrophes such as in `'tis`
+and `'tain't` are literal. `hrafn run - --quiet` reads a plan from
 stdin and prints only failed line numbers and a summary. Use it when plan
 arguments or results should stay out of terminal output.
 

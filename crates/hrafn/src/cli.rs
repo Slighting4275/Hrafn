@@ -574,7 +574,7 @@ fn net_body(res: &Value, rest: &[String]) -> i32 {
 }
 
 /// Commands after which a replay waits for the page to settle.
-const SETTLE_AFTER: [&str; 11] = ["open", "navigate", "back", "forward", "reload", "click", "type", "select", "keys", "drag", "tab"];
+const SETTLE_AFTER: [&str; 11] = ["open", "navigate", "back", "forward", "reload", "click", "type", "select", "keys", "drag", "switch"];
 
 /// Run a plan file (or `-` for stdin): one command per line.
 fn run_plan(rest: &[String], tab: Option<i64>) -> i32 {
@@ -622,16 +622,21 @@ fn run_plan(rest: &[String], tab: Option<i64>) -> i32 {
         } else if ["run", "doctor", "help", "screenshot"].contains(&cmd.as_str()) {
             Err(format!("`{cmd}` can't be used inside a plan"))
         } else {
-            build(cmd, args).and_then(|(name, a)| call(&name, a, tab)).and_then(|resp| {
-                if resp.ok {
-                    Ok(match &resp.result {
-                        Value::String(s) => s.clone(),
-                        Value::Object(o) if o.contains_key("title") => o["title"].as_str().unwrap_or("").to_string(),
-                        _ => "ok".into(),
-                    })
-                } else {
-                    Err(resp.error.unwrap_or_else(|| "failed".into()))
+            build(cmd, args).and_then(|(name, a)| {
+                let resp = call(&name, a, tab)?;
+                if !resp.ok {
+                    return Err(resp.error.unwrap_or_else(|| "failed".into()));
                 }
+                if SETTLE_AFTER.contains(&name.as_str()) {
+                    let settled = call("wait_stable", json!({ "quiet_ms": 300, "timeout_ms": 8000 }), tab)
+                        .and_then(|response| if response.ok { Ok(()) } else { Err(response.error.unwrap_or_else(|| "wait failed".into())) });
+                    settled.map_err(|e| format!("action completed, but the page did not settle: {e}"))?;
+                }
+                Ok(match &resp.result {
+                    Value::String(s) => s.clone(),
+                    Value::Object(o) if o.contains_key("title") => o["title"].as_str().unwrap_or("").to_string(),
+                    _ => "ok".into(),
+                })
             })
         };
         match result {
@@ -639,9 +644,6 @@ fn run_plan(rest: &[String], tab: Option<i64>) -> i32 {
                 passed += 1;
                 if !quiet {
                     println!("ok   line {}: {}  ({})", n + 1, line.trim(), msg.lines().next().unwrap_or(""));
-                }
-                if SETTLE_AFTER.contains(&cmd.as_str()) {
-                    let _ = call("wait_stable", json!({ "quiet_ms": 300, "timeout_ms": 8000 }), tab);
                 }
             }
             Err(e) => {

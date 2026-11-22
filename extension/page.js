@@ -4,9 +4,63 @@ export function pageAction(expectedUrl, command, args) {
   const fail = (error) => ({ error });
   const ok = (value) => ({ value });
   try {
+    if (command === 'clickReceipt') {
+      // Only read our isolated-world record. A hash change can preserve this
+      // document, whereas a new document has no record for this click.
+      const receipt = globalThis.hrafnClickReceipts?.get(args.id);
+      receipt?.cleanup();
+      return ok(receipt?.seen ?? false);
+    }
     const expected = new URL(expectedUrl);
     if (!['http:', 'https:'].includes(expected.protocol) || location.href !== expected.href) {
       return fail('the web page changed before Hrafn could act');
+    }
+
+    if (command === 'watchClick') {
+      const hit = document.elementFromPoint(args.x, args.y);
+      if (!hit) return ok(false);
+      const receipts = globalThis.hrafnClickReceipts ??= new Map();
+      const record = { seen: false, cleanup };
+      const timer = setTimeout(cleanup, 5000);
+      receipts.set(args.id, record);
+      window.addEventListener('click', observe, true);
+      return ok(true);
+
+      function observe(event) {
+        if (event.isTrusted && event.button === 0 && event.composedPath().includes(hit) &&
+            Math.abs(event.clientX - args.x) <= 2 && Math.abs(event.clientY - args.y) <= 2) {
+          record.seen = true;
+          window.removeEventListener('click', observe, true);
+        }
+      }
+
+      function cleanup() {
+        clearTimeout(timer);
+        window.removeEventListener('click', observe, true);
+        receipts.delete(args.id);
+      }
+    }
+
+    if (command === 'settle') {
+      return new Promise((resolve) => {
+        let changedAt = performance.now();
+        const deadline = changedAt + args.timeoutMs;
+        const observer = new MutationObserver(() => { changedAt = performance.now(); });
+        observer.observe(document, { childList: true, subtree: true, attributes: true, characterData: true });
+        function check() {
+          const now = performance.now();
+          if (now >= deadline) {
+            observer.disconnect();
+            resolve(fail('main page did not settle before the timeout'));
+          } else if (document.readyState === 'complete' && now - changedAt >= args.quietMs) {
+            observer.disconnect();
+            resolve(ok(true));
+          } else {
+            setTimeout(check, Math.min(50, deadline - now));
+          }
+        }
+        check();
+      });
     }
 
     if (command === 'probe') {

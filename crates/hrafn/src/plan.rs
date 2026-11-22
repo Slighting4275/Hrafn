@@ -10,7 +10,8 @@
 
 use serde_json::Value;
 
-/// Split one line into words. A leading single quote preserves literal text. Inside double quotes, `\"`, `\\`,
+/// Split one line into words. A pair of single quotes at word boundaries preserves literal text.
+/// Other apostrophes are literal. Inside double quotes, `\"`, `\\`,
 /// `\n`, `\r` and `\t` are escapes (so multi-line text fits on one plan line).
 /// Returns `None` for blank lines and comments.
 pub fn split(line: &str) -> Result<Option<Vec<String>>, String> {
@@ -24,12 +25,24 @@ pub fn split(line: &str) -> Result<Option<Vec<String>>, String> {
     let mut chars = line.chars();
     while let Some(c) = chars.next() {
         match c {
-            '"' | '\'' if c == '"' || !in_word => {
+            '\'' if !in_word => {
+                let rest = chars.as_str();
+                // Accept the first closing apostrophe only at a word boundary.
+                // This preserves old bare arguments such as 'tis and 'tain't.
+                if let Some(end) = rest.find('\'').filter(|end| rest[end + 1..].chars().next().is_none_or(char::is_whitespace)) {
+                    cur.push_str(&rest[..end]);
+                    chars = rest[end + 1..].chars();
+                } else {
+                    cur.push(c);
+                }
+                in_word = true;
+            }
+            '"' => {
                 in_word = true;
                 loop {
                     match chars.next() {
-                        Some(end) if end == c => break,
-                        Some('\\') if c == '"' => match chars.next() {
+                        Some('"') => break,
+                        Some('\\') => match chars.next() {
                             Some('n') => cur.push('\n'),
                             Some('r') => cur.push('\r'),
                             Some('t') => cur.push('\t'),
@@ -37,7 +50,7 @@ pub fn split(line: &str) -> Result<Option<Vec<String>>, String> {
                             None => return Err("unfinished escape".into()),
                         },
                         Some(ch) => cur.push(ch),
-                        None => return Err(format!("missing closing {c} quote")),
+                        None => return Err("missing closing double quote".into()),
                     }
                 }
             }

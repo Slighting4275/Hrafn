@@ -238,13 +238,24 @@ fn extension_frame_fixture(dir: &Path) {
             const show = document.createElement('button');
             show.id = 'show-extension-frame';
             show.textContent = 'Show extension frame';
-            show.addEventListener('click', () => setTimeout(() => document.body.prepend(frame), 700));
+            let clicks = 0;
+            show.addEventListener('click', () => {
+                document.querySelector('#out').textContent = `Frame click count: ${++clicks}`;
+                document.body.prepend(frame);
+            });
             document.body.prepend(show);
         } else {
             document.body.prepend(frame);
         }
         document.querySelector('#q').addEventListener('input', (event) => {
             document.querySelector('#out').textContent = `field received ${event.target.value.length} characters`;
+            if (event.target.value === 'show late action') setTimeout(() => {
+                const action = document.createElement('button');
+                action.id = 'late-action';
+                action.textContent = 'Late action';
+                action.addEventListener('click', () => document.querySelector('#out').textContent = 'Late action clicked');
+                document.body.prepend(action);
+            }, 180);
         });
         const number = document.createElement('input');
         number.type = 'number';
@@ -497,7 +508,7 @@ pub fn run(unsandboxed: bool) {
         c.failures.push("quiet replay".into());
     }
     c.check("single-quoted replay sets the intended value", &["eval", "document.body.dataset.note"], |o| o.trim() == "fixture secret");
-    std::fs::write(&plan, "eval 'fixture secret\n").unwrap();
+    std::fs::write(&plan, "eval \"fixture secret\n").unwrap();
     let (ok, out, err) = c.h(&["run", &plan_s, "--quiet"]);
     if !ok && out.trim() == "FAIL line 1\n0 passed, 1 failed" && err.is_empty() {
         eprintln!("PASS quiet replay keeps parse diagnostics out of its output");
@@ -604,15 +615,18 @@ pub fn run(unsandboxed: bool) {
     }
     c.check("click the top-level button with an extension frame", &["click", "#go"], |o| o.contains("clicked #go"));
     c.check("read the result of the top-level click", &["read", "--text-only"], |o| o.contains("clicked"));
+    std::fs::write(&plan, "type #q 'show late action'\nclick #late-action\n").unwrap();
+    c.check("replay waits for a dependent fallback action", &["run", &plan_s, "--quiet"], |o| o.trim() == "2 passed, 0 failed");
+    c.check("the dependent fallback action ran", &["read", "#out", "--text-only"], |o| o.trim() == "Late action clicked");
     c.check("start the delayed address change", &["click", "#change-address"], |o| o.contains("clicked #change-address"));
     c.check("wait through the address change with a blocked debugger", &["wait-for", "--text", "Address change complete", "--timeout", "2500"], |o| o.contains("is there"));
     c.check("close the extension frame test page", &["tab", "close"], |o| o.contains("closed tab"));
     c.check("open the dynamic extension frame test page", &["tab", "new", &format!("{site}/extension-frame?dynamic")], |o| o.contains("Hrafn test page"));
     c.check("attach before the frame appears", &["tree"], |o| o.contains("Show extension frame"));
     c.check("show the frame on an attached tab", &["click", "#show-extension-frame"], |o| o.contains("clicked #show-extension-frame"));
-    // Let the subframe finish navigating before the next debugger command.
-    std::thread::sleep(Duration::from_millis(900));
+    c.check("wait for the dynamically inserted frame to load", &["wait-for", "--text", "Extension frame loaded", "--timeout", "5000"], |o| o.contains("is there"));
     c.check("read after the debugger loses access", &["read", "--text-only"], |o| o.contains("Extension frame loaded"));
+    c.check("the dynamic frame click was delivered exactly once", &["read", "#out", "--text-only"], |o| o.trim() == "Frame click count: 1");
     c.check("close the dynamic extension frame test page", &["tab", "close"], |o| o.contains("closed tab"));
 
     // ---- site adapters, against local mock-ups of each site's page structure

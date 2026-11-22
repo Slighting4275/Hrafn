@@ -18,6 +18,15 @@ fn js_str(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
 }
 
+fn matches_site(url: &str, host: &str) -> bool {
+    let Ok(uri) = url.split('#').next().unwrap_or(url).parse::<ureq::http::Uri>() else { return false };
+    if !matches!(uri.scheme_str(), Some("https" | "http")) {
+        return false;
+    }
+    let hostname = uri.host().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
+    hostname == host || hostname.strip_suffix(host).is_some_and(|prefix| prefix.ends_with('.'))
+}
+
 /// The tab to use for a site: the current tab if it shows the site (by address or
 /// by its page markup), else another open tab of the site, else open `home` (or
 /// fail when `home` is empty).
@@ -26,8 +35,10 @@ fn site_tab(rpc: Rpc, tab: Option<i64>, host: &str, home: &str, looks_right: &st
         return Ok(t);
     }
     // The current tab, if it already shows the site (or a page that looks like it).
-    if eval(rpc, None, &format!("location.host.includes({}) || !!({looks_right})", js_str(host))).is_ok_and(|v| v == Value::Bool(true))
-        && let Some(id) = rpc("current_tab", json!({}), None)?["id"].as_i64()
+    if let Ok(current) = rpc("current_tab", json!({}), None)
+        && let Some(id) = current["id"].as_i64()
+        && (current["url"].as_str().is_some_and(|url| matches_site(url, host))
+            || eval(rpc, Some(id), &format!("!!({looks_right})")).is_ok_and(|v| v == Value::Bool(true)))
     {
         return Ok(id);
     }
@@ -36,7 +47,7 @@ fn site_tab(rpc: Rpc, tab: Option<i64>, host: &str, home: &str, looks_right: &st
         .as_array()
         .into_iter()
         .flatten()
-        .find(|t| t["url"].as_str().is_some_and(|u| u.contains(host)))
+        .find(|t| t["url"].as_str().is_some_and(|u| matches_site(u, host)))
         .and_then(|t| t["id"].as_i64())
     {
         return Ok(id);
@@ -665,6 +676,20 @@ pub fn gdocs(rpc: Rpc, tab: Option<i64>, args: &[String], raw_json: bool) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn site_selection_uses_the_url_hostname() {
+        let rpc = |cmd: &str, _: Value, _: Option<i64>| match cmd {
+            "current_tab" => Ok(json!({"id": 1, "url": "https://example.test"})),
+            "eval" => Ok(json!(false)),
+            "tabs" => Ok(json!([
+                {"id": 2, "url": "https://example.test/links?site=linkedin.com"},
+                {"id": 3, "url": "https://www.linkedin.com/jobs#search"}
+            ])),
+            other => Err(format!("unexpected command {other}")),
+        };
+        assert_eq!(site_tab(&rpc, None, "linkedin.com", "", "false").unwrap(), 3);
+    }
 
     #[test]
     fn google_urls() {

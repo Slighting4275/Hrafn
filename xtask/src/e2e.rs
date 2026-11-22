@@ -2,6 +2,7 @@
 //! the built extension, starts the real `hrafn` host, and every CLI command is run
 //! against a small local test site. The user's own browser and profile are untouched.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -139,10 +140,31 @@ fn serve() -> String {
             let text = |b: &str, t: &str| {
                 tiny_http::Response::from_string(b).with_header(format!("Content-Type: {t}").parse::<tiny_http::Header>().unwrap())
             };
+            if matches!(path, "/held-events" | "/held-response") {
+                let (mime, first, last) = if path == "/held-events" {
+                    ("text/event-stream", "data: ready\n\n", "data: done\n\n")
+                } else {
+                    ("text/plain", "ready", "done")
+                };
+                std::thread::spawn(move || {
+                    let mut writer = req.into_writer();
+                    let length = first.len() + last.len();
+                    if write!(writer, "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {length}\r\n\r\n{first}")
+                        .and_then(|_| writer.flush()).is_ok()
+                    {
+                        std::thread::sleep(Duration::from_secs(5));
+                        let _ = writer.write_all(last.as_bytes());
+                    }
+                });
+                continue;
+            }
             let resp = match path {
                 "/" => html(PAGE_ONE),
                 "/extension-frame" => html(PAGE_ONE),
                 "/two" => html(PAGE_TWO),
+                "/redirect-start" => html(r#"<!doctype html><a id="redirect" href="/redirect">Go to page two</a>"#),
+                "/redirect" => html("").with_status_code(302).with_header("Location: /redirect-last".parse::<tiny_http::Header>().unwrap()),
+                "/redirect-last" => html("").with_status_code(307).with_header("Location: /two".parse::<tiny_http::Header>().unwrap()),
                 p if p == "/chatgpt" || p.starts_with("/c/") => html(FAKE_CHATGPT),
                 "/li/job" => html(FAKE_LINKEDIN_JOB),
                 "/li/job2026" => html(FAKE_LINKEDIN_JOB_2026),
@@ -340,11 +362,7 @@ pub fn run(unsandboxed: bool) {
     });
     let _registration = HostRegistration::install(&home, &program);
     let ext = work.join("ext");
-    std::fs::create_dir_all(&ext).unwrap();
-    for entry in std::fs::read_dir(crate::dist()).unwrap() {
-        let p = entry.unwrap().path();
-        std::fs::copy(&p, ext.join(p.file_name().unwrap())).unwrap();
-    }
+    crate::copy_extension(&crate::dist(), &ext).unwrap();
     let sock = work.join("hrafn.sock");
     let site = serve();
     let fixture = work.join("extension-frame-fixture");
@@ -370,6 +388,15 @@ pub fn run(unsandboxed: bool) {
     eprintln!("host connected after {:?}", start.elapsed());
 
     c.check("status", &["status"], |o| o.contains("\"extension\"") && o.contains("Chrome/"));
+    c.check("open the redirect fixture", &["open", &format!("{site}/redirect-start")], |_| true);
+    c.check("click through two redirects", &["click", "#redirect"], |o| o.contains("clicked #redirect"));
+    c.check("the redirected document has loaded", &["wait-for", "--text", "Page two", "--timeout", "2500"], |o| o.contains("is there"));
+    c.check("redirected page settles", &["wait-stable", "--timeout", "1500"], |o| o.contains("stable"));
+    c.check("network log shows both redirect statuses", &["net", "log", "--filter", "/redirect"], |o| {
+        o.lines().any(|l| l.contains("302") && l.ends_with("/redirect"))
+            && o.lines().any(|l| l.contains("307") && l.ends_with("/redirect-last"))
+    });
+    c.check("close the redirect fixture", &["tab", "close"], |o| o.contains("closed tab"));
     let url = format!("{site}/");
     let opened = c.check("open", &["open", &url], |o| o.contains("Hrafn test page"));
     let test_tab = serde_json::from_str::<serde_json::Value>(&opened).ok().and_then(|v| v["id"].as_i64()).unwrap_or(0).to_string();
@@ -392,6 +419,9 @@ pub fn run(unsandboxed: bool) {
     c.check("typed value", &["eval", "document.getElementById('name').value"], |o| o.trim() == "Test User");
     c.check("type --append", &["type", "#name", "!", "--append"], |_| true);
     c.check("appended value", &["eval", "document.getElementById('name').value"], |o| o.trim() == "Test User!");
+    c.check("type text that looks like a global flag", &["type", "#name", "--json"], |o| o.contains("typed 6"));
+    c.check("flag-like text is entered literally", &["eval", "document.getElementById('name').value"], |o| o.trim() == "--json");
+    c.check("restore the form value", &["type", "#name", "Test User!"], |o| o.contains("typed 10"));
     c.check("select", &["select", "#color", "blue"], |o| o.contains("blue"));
     c.check("type into form", &["type", "#q", "ravens"], |_| true);
     c.check("keys Enter submits", &["keys", "Enter"], |_| true);
@@ -457,6 +487,17 @@ pub fn run(unsandboxed: bool) {
     c.check("wait for stream", &["wait", "1500"], |_| true);
     c.check("sse log", &["sse"], |o| o.contains("[tick] one") && o.contains("[message] two"));
     c.check("close the stream", &["eval", "window.__es.close(); 'closed'"], |_| true);
+    c.check("receive the first event from a held-open stream", &["eval", "new Promise(resolve => { window.__es = new EventSource('/held-events'); window.__es.onmessage = e => resolve(e.data); })"], |o| o.trim() == "ready");
+    c.check("page settles while the event stream is still open", &["wait-stable", "--timeout", "1500"], |o| o.contains("stable"));
+    c.check("close the held-open stream", &["eval", "window.__es.close(); window.__es.readyState"], |o| o.trim() == "2");
+    c.check("start receiving an ordinary response", &["eval", "fetch('/held-response').then(r => r.status)"], |o| o.trim() == "200");
+    let (settled, _, err) = c.h(&["wait-stable", "--ms", "0", "--timeout", "300"]);
+    if settled || !err.contains("page did not settle") {
+        c.failures.push(format!("ordinary unfinished response blocks settlement: {err}"));
+    }
+    c.check("detach while the ordinary response is pending", &["detach"], |o| o.contains("stopped debugging"));
+    c.check("a new debugger session settles", &["wait-stable", "--timeout", "1500"], |o| o.contains("stable"));
+    c.check("detach preserves captured requests", &["net", "log", "--filter", "/held-response"], |o| o.contains("/held-response"));
 
     // ---- record and replay
     c.check("reload before recording", &["reload"], |_| true);
@@ -487,6 +528,10 @@ pub fn run(unsandboxed: bool) {
     let tabs_before_replay = tab_ids(&c);
     c.check("replay plan", &["run", &plan_s], |o| o.contains("5 passed, 0 failed"));
     c.check("replay reached the same end state", &["eval", "document.title + ' / ' + document.getElementById('out').textContent + ' / ' + document.getElementById('color').value"], |o| o.trim() == "submitted:ravens / clicked / blue");
+    std::fs::write(&plan, format!("open {site}/\ntype #q explicit-tab-target\n")).unwrap();
+    c.check("replay can open a tab from an explicit starting tab", &["--tab", &test_tab, "run", &plan_s], |o| o.contains("2 passed, 0 failed"));
+    c.check("replay follows its new tab", &["eval", "document.getElementById('q').value"], |o| o.trim() == "explicit-tab-target");
+    c.check("replay leaves the starting tab's input alone", &["--tab", &test_tab, "eval", "document.getElementById('q').value"], |o| o.trim() == "ravens");
     std::fs::write(&plan, "open about:blank\nclick \"#does-not-exist\"\nkeys Enter\n").unwrap();
     let (ok, out, _) = c.h(&["run", &plan_s]);
     if !ok && out.contains("FAIL line 2") && out.contains("1 passed, 1 failed") {

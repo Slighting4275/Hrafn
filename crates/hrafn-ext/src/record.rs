@@ -23,11 +23,11 @@ pub fn record_step(steps: &mut Vec<Value>, step: Value) {
             return;
         }
     }
-    // A double-click also fires two clicks first; keep only the double-click.
-    if step["type"] == "dblclick" {
-        while steps.last().is_some_and(|l| l["type"] == "click" && l["target"] == step["target"]) {
-            steps.pop();
-        }
+    // The page recorder reports only the first click of a double-click.
+    if step["type"] == "dblclick"
+        && steps.last().is_some_and(|l| l["type"] == "click" && l["target"] == step["target"])
+    {
+        steps.pop();
     }
     steps.push(step);
 }
@@ -83,5 +83,15 @@ mod tests {
             json!({"type": "dblclick", "target": "#b"}),
         ]);
         assert_eq!(steps, vec![json!({"type": "click", "target": "#a"}), json!({"type": "dblclick", "target": "#b"})]);
+    }
+
+    #[test]
+    fn earlier_click_on_the_same_element_survives_double_click() {
+        let steps = run(&[
+            json!({"type": "click", "target": "#a"}),
+            json!({"type": "click", "target": "#a"}),
+            json!({"type": "dblclick", "target": "#a"}),
+        ]);
+        assert_eq!(steps, vec![json!({"type": "click", "target": "#a"}), json!({"type": "dblclick", "target": "#a"})]);
     }
 }

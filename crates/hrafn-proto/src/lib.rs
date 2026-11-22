@@ -67,17 +67,25 @@ pub mod frame {
     /// Returns `Ok(None)` at a clean end of input (the browser closed the pipe).
     pub fn read(r: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
         let mut len = [0u8; 4];
-        match r.read_exact(&mut len) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e),
+        let read = loop {
+            match r.read(&mut len) {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                result => break result?,
+            }
+        };
+        if read == 0 {
+            return Ok(None);
         }
+        r.read_exact(&mut len[read..])?;
         let n = u32::from_ne_bytes(len) as usize;
         if n > MAX_FROM_BROWSER {
             return Err(io::Error::new(io::ErrorKind::InvalidData, format!("frame of {n} bytes is too large")));
         }
-        let mut buf = vec![0u8; n];
-        r.read_exact(&mut buf)?;
+        let mut buf = Vec::new();
+        r.take(n as u64).read_to_end(&mut buf)?;
+        if buf.len() != n {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete frame body"));
+        }
         Ok(Some(buf))
     }
 }
@@ -104,6 +112,17 @@ mod tests {
         let mut bad = Vec::new();
         bad.extend_from_slice(&((frame::MAX_FROM_BROWSER + 1) as u32).to_ne_bytes());
         assert!(frame::read(&mut &bad[..]).is_err());
+    }
+
+    #[test]
+    fn truncated_frame_is_distinct_from_clean_eof() {
+        use std::io::ErrorKind;
+        for len in 1..4 {
+            assert_eq!(frame::read(&mut &[0u8; 4][..len]).unwrap_err().kind(), ErrorKind::UnexpectedEof);
+        }
+        let mut truncated = 2u32.to_ne_bytes().to_vec();
+        truncated.push(b'{');
+        assert_eq!(frame::read(&mut truncated.as_slice()).unwrap_err().kind(), ErrorKind::UnexpectedEof);
     }
 
     #[test]

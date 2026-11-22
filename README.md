@@ -31,6 +31,11 @@ If the debugger drops a reply during a click, Hrafn can confirm a matching
 browser click in the main page. An unconfirmed click should be checked before
 repeating the command.
 
+`wait-stable` waits for the document to finish loading and for page requests to
+go quiet. Browser-extension resources and open event streams remain visible in
+the network log. Use `wait-for` with destination text or a selector when a click
+starts a navigation or schedules an update.
+
 ### Sandboxed browsers (firejail)
 
 If your browser runs under firejail, its AppArmor profile only lets it run

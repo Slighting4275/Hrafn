@@ -15,6 +15,8 @@ pub mod record;
 mod js;
 #[cfg(target_arch = "wasm32")]
 mod ext;
+#[cfg(any(test, target_arch = "wasm32"))]
+mod network;
 
 #[cfg(target_arch = "wasm32")]
 pub use ext::start;

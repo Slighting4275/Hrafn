@@ -141,6 +141,15 @@ pub fn install_program(src: &Path, dst: &Path) {
     eprintln!("installed {}", dst.display());
 }
 
+fn copy_extension(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
+    }
+    Ok(())
+}
+
 fn install() {
     build();
     let home = home();
@@ -175,12 +184,7 @@ fn install() {
 
     // Brave's folder picker only shows XDG folders, so the extension goes to Downloads.
     let copy = home.join("Downloads/Hrafn-Extension");
-    let _ = std::fs::remove_dir_all(&copy);
-    std::fs::create_dir_all(&copy).unwrap();
-    for entry in std::fs::read_dir(dist()).unwrap() {
-        let p = entry.unwrap().path();
-        std::fs::copy(&p, copy.join(p.file_name().unwrap())).unwrap();
-    }
+    copy_extension(&dist(), &copy).unwrap();
     eprintln!("extension copied to {} (load it in brave://extensions with Developer mode on)", copy.display());
 }
 
@@ -191,5 +195,27 @@ fn main() {
         Some("e2e") => e2e::run(std::env::args().any(|a| a == "--unsandboxed")),
         Some("id") => println!("{}", extension_id()),
         _ => eprintln!("usage: cargo xtask <build|install|e2e|id>"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copying_extension_updates_package_files_and_preserves_other_files() {
+        let work = std::env::temp_dir().join(format!("hrafn-extension-copy-{}", std::process::id()));
+        let src = work.join("dist");
+        let dst = work.join("install");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join("manifest.json"), "new package").unwrap();
+        std::fs::write(dst.join("manifest.json"), "old package").unwrap();
+        std::fs::write(dst.join("notes.txt"), "local notes").unwrap();
+
+        copy_extension(&src, &dst).unwrap();
+        assert_eq!(std::fs::read_to_string(dst.join("manifest.json")).unwrap(), "new package");
+        assert_eq!(std::fs::read_to_string(dst.join("notes.txt")).unwrap(), "local notes");
+        std::fs::remove_dir_all(work).unwrap();
     }
 }

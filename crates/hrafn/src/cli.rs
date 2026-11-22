@@ -100,7 +100,7 @@ fn fail(msg: impl AsRef<str>) -> i32 {
     1
 }
 
-pub fn run(mut args: Vec<String>) -> i32 {
+pub fn run(args: Vec<String>) -> i32 {
     let mut tab = None;
     let mut raw_json = false;
     let mut i = 0;
@@ -108,23 +108,22 @@ pub fn run(mut args: Vec<String>) -> i32 {
         match args[i].as_str() {
             "--json" => {
                 raw_json = true;
-                args.remove(i);
+                i += 1;
             }
-            "--tab" if i + 1 < args.len() => match args[i + 1].parse::<i64>() {
-                Ok(t) => {
+            "--tab" => match args.get(i + 1).and_then(|id| id.parse::<i64>().ok()) {
+                Some(t) => {
                     tab = Some(t);
-                    args.drain(i..i + 2);
+                    i += 2;
                 }
-                Err(_) => return fail("--tab needs a number (see `hrafn tabs`)"),
+                None => return fail("--tab needs a number (see `hrafn tabs`)"),
             },
-            _ => i += 1,
+            _ => break,
         }
     }
-    let Some(cmd) = args.first().cloned() else {
+    let Some((cmd, rest)) = args[i..].split_first() else {
         print!("{HELP}");
         return 0;
     };
-    let rest = &args[1..];
     match cmd.as_str() {
         "help" | "-h" | "--help" => {
             print!("{HELP}");
@@ -159,7 +158,7 @@ pub fn run(mut args: Vec<String>) -> i32 {
             }
             None => fail("usage: hrafn wait <milliseconds>"),
         },
-        _ => match build(&cmd, rest) {
+        _ => match build(cmd, rest) {
             Ok((name, a)) => send_and_print(&name, a, tab, raw_json, rest),
             Err(e) => fail(e),
         },
@@ -197,7 +196,7 @@ fn num(v: Option<String>, name: &str) -> Result<Option<u64>, String> {
 /// "X,Y" -> [x, y]
 fn coords(s: &str) -> Result<[f64; 2], String> {
     let (x, y) = s.split_once(',').ok_or_else(|| format!("expected X,Y but got `{s}`"))?;
-    let p = |v: &str| v.trim().parse::<f64>().map_err(|_| format!("expected X,Y but got `{s}`"));
+    let p = |v: &str| v.trim().parse::<f64>().ok().filter(|n| n.is_finite()).ok_or_else(|| format!("expected finite X,Y coordinates but got `{s}`"));
     Ok([p(x)?, p(y)?])
 }
 
@@ -227,7 +226,7 @@ fn build(cmd: &str, rest: &[String]) -> Result<(String, Value), String> {
                 out("switch", json!({ "id": id }))
             }
             Some("close") => {
-                let id = r.get(1).and_then(|s| s.parse::<i64>().ok());
+                let id = r.get(1).map(|s| s.parse::<i64>().map_err(|_| "usage: hrafn tab close [id] (id must be a number)")).transpose()?;
                 out("close", json!({ "id": id }))
             }
             _ => Err("usage: hrafn tab new [url] | tab switch <id> | tab close [id]".into()),
@@ -331,6 +330,9 @@ fn build(cmd: &str, rest: &[String]) -> Result<(String, Value), String> {
             Some("clear") => out("override", json!({ "action": "clear" })),
             Some("add") => {
                 let status = num(opt(&mut r, "--status"), "--status")?;
+                if status.is_some_and(|status| !(100..=599).contains(&status)) {
+                    return Err("--status must be an HTTP status code from 100 to 599".into());
+                }
                 let ctype = opt(&mut r, "--type");
                 let body = match (opt(&mut r, "--body"), opt(&mut r, "--file")) {
                     (Some(b), _) => b,
@@ -356,8 +358,11 @@ fn build(cmd: &str, rest: &[String]) -> Result<(String, Value), String> {
             _ => Err("usage: hrafn record start | record stop [plan-file] | record status".into()),
         },
         "type" => {
-            let append = flag(&mut r, "--append");
             need(&r, 2, "type <target> <text> [--append]")?;
+            let append = r.len() > 2 && r.last().is_some_and(|a| a == "--append");
+            if append {
+                r.pop();
+            }
             out("type", json!({ "target": r[0], "text": r[1..].join(" "), "append": append }))
         }
         "select" => {
@@ -577,7 +582,7 @@ fn net_body(res: &Value, rest: &[String]) -> i32 {
 const SETTLE_AFTER: [&str; 11] = ["open", "navigate", "back", "forward", "reload", "click", "type", "select", "keys", "drag", "switch"];
 
 /// Run a plan file (or `-` for stdin): one command per line.
-fn run_plan(rest: &[String], tab: Option<i64>) -> i32 {
+fn run_plan(rest: &[String], mut tab: Option<i64>) -> i32 {
     let keep_going = rest.iter().any(|a| a == "--keep-going");
     let quiet = rest.iter().any(|a| a == "--quiet");
     let Some(src) = rest.iter().find(|a| !a.starts_with("--")) else {
@@ -623,9 +628,15 @@ fn run_plan(rest: &[String], tab: Option<i64>) -> i32 {
             Err(format!("`{cmd}` can't be used inside a plan"))
         } else {
             build(cmd, args).and_then(|(name, a)| {
+                let closed_tab = a["id"].as_i64().or(tab);
                 let resp = call(&name, a, tab)?;
                 if !resp.ok {
                     return Err(resp.error.unwrap_or_else(|| "failed".into()));
+                }
+                match name.as_str() {
+                    "open" | "switch" => tab = resp.result["id"].as_i64(),
+                    "close" if closed_tab == tab => tab = None,
+                    _ => {}
                 }
                 if SETTLE_AFTER.contains(&name.as_str()) {
                     let settled = call("wait_stable", json!({ "quiet_ms": 300, "timeout_ms": 8000 }), tab)

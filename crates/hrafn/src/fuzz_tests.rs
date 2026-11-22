@@ -72,6 +72,17 @@ fn command_building_never_panics() {
 }
 
 #[test]
+fn command_arguments_are_validated_before_acting() {
+    let build = |cmd, args: &[&str]| cli::build_for_tests(cmd, &args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    assert!(build("tab", &["close", "oops"]).is_err());
+    assert!(build("override", &["add", "*/x", "--status", "65736"]).is_err());
+    assert!(build("click", &["--at", "NaN,1"]).is_err());
+    let (_, args) = build("type", &["#q", "--append"]).unwrap();
+    assert_eq!(args["text"], "--append");
+    assert_eq!(args["append"], false);
+}
+
+#[test]
 fn ocr_matching_never_panics() {
     let mut rng = Rng::new(2024);
     for _ in 0..3_000 {

@@ -10,13 +10,60 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 /// How long one command may take inside the browser (page loads, waits).
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(150);
 
-type Pending = Arc<Mutex<HashMap<u64, Sender<Response>>>>;
+#[derive(Default)]
+struct Pending {
+    clients: Mutex<Clients>,
+    drained: Condvar,
+}
+
+#[derive(Default)]
+struct Clients {
+    closed: bool,
+    active: usize,
+    replies: HashMap<u64, Sender<Response>>,
+}
+
+impl Pending {
+    fn register(&self, id: u64, sender: Sender<Response>) -> bool {
+        let mut clients = self.clients.lock().unwrap();
+        if clients.closed {
+            return false;
+        }
+        clients.replies.insert(id, sender);
+        clients.active += 1;
+        true
+    }
+
+    fn deliver(&self, response: Response) {
+        if let Some(sender) = self.clients.lock().unwrap().replies.remove(&response.id) {
+            let _ = sender.send(response);
+        }
+    }
+
+    fn finish(&self, id: u64) {
+        let mut clients = self.clients.lock().unwrap();
+        clients.replies.remove(&id);
+        clients.active -= 1;
+        if clients.closed && clients.active == 0 {
+            self.drained.notify_one();
+        }
+    }
+
+    fn close(&self) {
+        let mut clients = self.clients.lock().unwrap();
+        clients.closed = true;
+        clients.replies.clear();
+        // Let active clients write their replies. Bound the wait in case a
+        // client has stopped reading its socket.
+        drop(self.drained.wait_timeout_while(clients, Duration::from_secs(2), |c| c.active > 0).unwrap());
+    }
+}
 
 fn log(msg: &str) {
     let line = format!("{} pid {} {msg}\n", now(), std::process::id());
@@ -54,7 +101,7 @@ pub fn run(origin: &str) -> i32 {
     let my_inode = std::fs::metadata(&sock).map(|m| m.ino()).ok();
     log(&format!("started for {origin}, listening on {}", sock.display()));
 
-    let pending: Pending = Arc::default();
+    let pending: Arc<Pending> = Arc::default();
     let out = Arc::new(Mutex::new(std::io::stdout()));
     let next_id = Arc::new(AtomicU64::new(1));
 
@@ -67,11 +114,7 @@ pub fn run(origin: &str) -> i32 {
             loop {
                 match frame::read(&mut stdin) {
                     Ok(Some(bytes)) => match serde_json::from_slice::<Response>(&bytes) {
-                        Ok(resp) => {
-                            if let Some(tx) = pending.lock().unwrap().remove(&resp.id) {
-                                let _ = tx.send(resp);
-                            }
-                        }
+                        Ok(resp) => pending.deliver(resp),
                         Err(e) => log(&format!("unreadable message from browser: {e}")),
                     },
                     Ok(None) => {
@@ -88,6 +131,7 @@ pub fn run(origin: &str) -> i32 {
             if std::fs::metadata(&sock).map(|m| m.ino()).ok() == my_inode {
                 let _ = std::fs::remove_file(&sock);
             }
+            pending.close();
             std::process::exit(0);
         });
     }
@@ -100,7 +144,7 @@ pub fn run(origin: &str) -> i32 {
     0
 }
 
-fn serve_client(stream: UnixStream, pending: Pending, out: Arc<Mutex<std::io::Stdout>>, next_id: Arc<AtomicU64>) {
+fn serve_client(stream: UnixStream, pending: Arc<Pending>, out: Arc<Mutex<std::io::Stdout>>, next_id: Arc<AtomicU64>) {
     let mut reader = BufReader::new(match stream.try_clone() {
         Ok(s) => s,
         Err(_) => return,
@@ -108,23 +152,28 @@ fn serve_client(stream: UnixStream, pending: Pending, out: Arc<Mutex<std::io::St
     let mut writer = stream;
     let mut line = String::new();
     while reader.read_line(&mut line).unwrap_or(0) > 0 {
+        let mut active = None;
         let resp = match serde_json::from_str::<Request>(line.trim()) {
             Ok(mut req) => {
                 let client_id = req.id;
                 // Ids are unique per host, not per client, so replies can't cross.
                 req.id = next_id.fetch_add(1, Ordering::Relaxed);
                 let (tx, rx) = mpsc::channel();
-                pending.lock().unwrap().insert(req.id, tx);
+                if !pending.register(req.id, tx) {
+                    break;
+                }
+                active = Some(req.id);
                 let sent = serde_json::to_vec(&req)
                     .map_err(|e| e.to_string())
                     .and_then(|b| frame::write(&mut *out.lock().unwrap(), &b).map_err(|e| e.to_string()));
                 let mut resp = match sent {
                     Err(e) => Response::err(req.id, format!("could not reach the browser: {e}")),
-                    Ok(()) => rx.recv_timeout(COMMAND_TIMEOUT).unwrap_or_else(|_| {
-                        Response::err(req.id, "the browser did not answer in time")
-                    }),
+                    Ok(()) => match rx.recv_timeout(COMMAND_TIMEOUT) {
+                        Ok(response) => response,
+                        Err(mpsc::RecvTimeoutError::Timeout) => Response::err(req.id, "the browser did not answer in time"),
+                        Err(mpsc::RecvTimeoutError::Disconnected) => Response::err(req.id, "the browser closed the connection"),
+                    },
                 };
-                pending.lock().unwrap().remove(&req.id);
                 resp.id = client_id;
                 resp
             }
@@ -132,7 +181,11 @@ fn serve_client(stream: UnixStream, pending: Pending, out: Arc<Mutex<std::io::St
         };
         let mut bytes = serde_json::to_vec(&resp).unwrap_or_default();
         bytes.push(b'\n');
-        if writer.write_all(&bytes).is_err() {
+        let written = writer.write_all(&bytes);
+        if let Some(id) = active {
+            pending.finish(id);
+        }
+        if written.is_err() {
             break;
         }
         line.clear();

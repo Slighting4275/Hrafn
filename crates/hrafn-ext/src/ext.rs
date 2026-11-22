@@ -1,6 +1,7 @@
 //! Service-worker side: native port, debugger sessions, command handlers.
 
 use crate::js::{self, call, from_js, get, now, sleep, to_js};
+use crate::network::NetworkLog;
 use crate::{ax, keys};
 use hrafn_proto::{HOST_NAME, Request, Response};
 use js_sys::{Function, Reflect};
@@ -18,10 +19,8 @@ const PAGE_FALLBACK_NOTICE: &str = "Another extension's frame blocks the debugge
 #[derive(Default)]
 struct TabLog {
     console: VecDeque<Value>,
-    net: VecDeque<Value>,
+    net: NetworkLog,
     sse: VecDeque<Value>,
-    inflight: i64,
-    last_net: f64,
 }
 
 /// A recording in progress on one tab.
@@ -104,6 +103,15 @@ fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
     STATE.with(|s| f(&mut s.borrow_mut()))
 }
 
+fn forget_debugger(tab: i64) {
+    with(|s| {
+        s.attached.remove(&tab);
+        if let Some(log) = s.logs.get_mut(&tab) {
+            log.net.reset_session();
+        }
+    });
+}
+
 struct ClickGuard(i64);
 
 impl ClickGuard {
@@ -145,7 +153,7 @@ pub fn start(page_action: Function) {
         &["chrome", "debugger", "onDetach"],
         Closure::<dyn FnMut(JsValue, JsValue)>::new(|source: JsValue, _reason: JsValue| {
             if let Some(tab) = get(&source, "tabId").as_f64() {
-                with(|s| s.attached.remove(&(tab as i64)));
+                forget_debugger(tab as i64);
             }
         })
         .into_js_value(),
@@ -262,30 +270,11 @@ fn on_cdp_event(tab: i64, method: &str, p: Value) {
                 let e = &p["entry"];
                 push(&mut log.console, json!({"ts": t, "level": e["level"], "text": e["text"], "url": e["url"]}));
             }
-            "Network.requestWillBeSent" => {
-                let r = &p["request"];
-                push(&mut log.net, json!({"ts": t, "id": p["requestId"], "method": r["method"], "url": r["url"], "type": p["type"], "status": null}));
-                log.inflight += 1;
-                log.last_net = t;
-            }
-            "Network.responseReceived" => {
-                if let Some(e) = log.net.iter_mut().rev().find(|e| e["id"] == p["requestId"]) {
-                    e["status"] = p["response"]["status"].clone();
-                    e["mime"] = p["response"]["mimeType"].clone();
-                }
-                log.last_net = t;
-            }
-            "Network.loadingFinished" | "Network.loadingFailed" => {
-                if method == "Network.loadingFailed"
-                    && let Some(e) = log.net.iter_mut().rev().find(|e| e["id"] == p["requestId"])
-                {
-                    e["failed"] = p["errorText"].clone();
-                }
-                log.inflight = (log.inflight - 1).max(0);
-                log.last_net = t;
-            }
+            "Network.requestWillBeSent" => log.net.request(&p, t, LOG_CAP),
+            "Network.responseReceived" => log.net.response(&p, t),
+            "Network.loadingFinished" | "Network.loadingFailed" => log.net.finished(&p, t),
             "Network.eventSourceMessageReceived" => {
-                let url = log.net.iter().rev().find(|e| e["id"] == p["requestId"]).map(|e| e["url"].clone()).unwrap_or(Value::Null);
+                let url = log.net.entries.iter().rev().find(|e| e["id"] == p["requestId"]).map(|e| e["url"].clone()).unwrap_or(Value::Null);
                 push(&mut log.sse, json!({"ts": t, "id": p["requestId"], "url": url, "event": p["eventName"], "data": p["data"]}));
             }
             "Page.frameNavigated" if p["frame"].get("parentId").is_none() => {
@@ -420,7 +409,7 @@ async fn cdp(tab: i64, method: &str, params: Value) -> Result<Value, String> {
         // The browser can drop the debugger mid-command (e.g. while it first shows
         // its "debugging" bar). Reattach once and retry.
         Err(e) if e.contains("Detached") || e.contains("not attached") => {
-            with(|s| s.attached.remove(&tab));
+            forget_debugger(tab);
             sleep(200).await;
             attach(tab).await?;
             cdp_raw(tab, method, params).await
@@ -642,7 +631,7 @@ async fn dispatch(r: &Request) -> Result<Value, String> {
             let tab = target_tab(r).await?;
             if with(|s| s.attached.contains(&tab)) {
                 call(&["chrome", "debugger"], "detach", vec![to_js(&json!({"tabId": tab}))]).await?;
-                with(|s| s.attached.remove(&tab));
+                forget_debugger(tab);
             }
             Ok(json!(format!("stopped debugging tab {tab}")))
         }
@@ -799,9 +788,14 @@ async fn wait_stable(r: &Request, tab: i64) -> Result<Value, String> {
     loop {
         match eval(tab, "document.readyState").await {
             Ok(ready) => {
-                let (inflight, last) = with(|s| s.logs.get(&tab).map(|l| (l.inflight, l.last_net)).unwrap_or((0, 0.0)));
-                if ready == "complete" && inflight == 0 && now() - last >= quiet {
+                let (pending, last) = with(|s| s.logs.get(&tab).map(|l| l.net.activity()).unwrap_or_default());
+                let idle = now() - last;
+                if ready == "complete" && pending == 0 && idle >= quiet {
                     return Ok(json!("page is stable"));
+                }
+                if now() >= end {
+                    let state = ready.as_str().unwrap_or("unknown");
+                    return Err(format!("page did not settle before the timeout (document: {state}, pending page requests: {pending}, required quiet: {quiet:.0} ms)"));
                 }
             }
             Err(e) if debugger_blocked_by_extension_frame(&e) => {
@@ -1063,10 +1057,14 @@ async fn page_command(r: &Request, tab: i64) -> Result<Value, String> {
                         if pattern.is_empty() {
                             return Err("give a URL pattern, e.g. '*/api/items*'".to_string());
                         }
+                        let status = arg(r, "status").as_u64().unwrap_or(200);
+                        if !(100..=599).contains(&status) {
+                            return Err("status must be an HTTP status code from 100 to 599".into());
+                        }
                         list.retain(|o| o.pattern != pattern);
                         list.push(Override {
                             pattern: pattern.clone(),
-                            status: arg(r, "status").as_u64().unwrap_or(200) as u16,
+                            status: status as u16,
                             content_type: arg(r, "content_type").as_str().unwrap_or("application/json").to_string(),
                             body: arg(r, "body").as_str().unwrap_or("").to_string(),
                         });
@@ -1245,7 +1243,7 @@ async fn page_command(r: &Request, tab: i64) -> Result<Value, String> {
                 let q = match r.cmd.as_str() {
                     "console" => &mut log.console,
                     "sse" => &mut log.sse,
-                    _ => &mut log.net,
+                    _ => &mut log.net.entries,
                 };
                 if clear {
                     q.clear();

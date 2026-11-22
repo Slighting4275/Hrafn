@@ -3,6 +3,7 @@
 use crate::js::{self, call, from_js, get, now, sleep, to_js};
 use crate::{ax, keys};
 use hrafn_proto::{HOST_NAME, Request, Response};
+use js_sys::{Function, Reflect};
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -11,6 +12,8 @@ use wasm_bindgen_futures::spawn_local;
 
 const LOG_CAP: usize = 2000;
 const DEFAULT_MAX_CHARS: usize = 30_000;
+const EXTENSION_FRAME_DENIED: &str = "Cannot access a chrome-extension:// URL of different extension";
+const PAGE_FALLBACK_NOTICE: &str = "Another extension's frame blocks the debugger. Use page text and CSS selectors for main-page controls.";
 
 #[derive(Default)]
 struct TabLog {
@@ -41,6 +44,7 @@ struct Override {
 #[derive(Default)]
 struct State {
     port: Option<JsValue>,
+    page_action: Option<Function>,
     reconnect_delay: i32,
     current_tab: Option<i64>,
     attached: HashSet<i64>,
@@ -51,6 +55,8 @@ struct State {
     headers: HashMap<i64, serde_json::Map<String, Value>>,
     last_tree: HashMap<i64, String>,
     style_seq: u32,
+    click_seq: u64,
+    clicking_tabs: HashSet<i64>,
 }
 
 /// Page-side recorder. It has to be JavaScript because it runs inside the page; it
@@ -98,6 +104,24 @@ fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
     STATE.with(|s| f(&mut s.borrow_mut()))
 }
 
+struct ClickGuard(i64);
+
+impl ClickGuard {
+    fn acquire(tab: i64) -> Result<Self, String> {
+        if with(|s| s.clicking_tabs.insert(tab)) {
+            Ok(Self(tab))
+        } else {
+            Err("a click is already in progress on this tab".into())
+        }
+    }
+}
+
+impl Drop for ClickGuard {
+    fn drop(&mut self) {
+        with(|s| s.clicking_tabs.remove(&self.0));
+    }
+}
+
 fn closure1(f: impl FnMut(JsValue) + 'static) -> JsValue {
     Closure::<dyn FnMut(JsValue)>::new(f).into_js_value()
 }
@@ -105,7 +129,8 @@ fn closure1(f: impl FnMut(JsValue) + 'static) -> JsValue {
 // ------------------------------------------------------------------ startup
 
 #[wasm_bindgen]
-pub fn start() {
+pub fn start(page_action: Function) {
+    with(|s| s.page_action = Some(page_action));
     // Debugger events: console and network logging.
     js::listen(
         &["chrome", "debugger", "onEvent"],
@@ -363,6 +388,7 @@ async fn attach(tab: i64) -> Result<(), String> {
                 attached = true;
                 break;
             }
+            Err(e) if e == EXTENSION_FRAME_DENIED => return Err(format!("{e}. {PAGE_FALLBACK_NOTICE}")),
             Err(e) => last_err = e,
         }
     }
@@ -484,6 +510,10 @@ async fn mouse(tab: i64, kind: &str, x: f64, y: f64) -> Result<(), String> {
 }
 
 async fn mouse_btn(tab: i64, kind: &str, x: f64, y: f64, button: &str, count: u32) -> Result<(), String> {
+    cdp(tab, "Input.dispatchMouseEvent", mouse_event(kind, x, y, button, count)).await.map(|_| ())
+}
+
+fn mouse_event(kind: &str, x: f64, y: f64, button: &str, count: u32) -> Value {
     let mut p = json!({"type": kind, "x": x, "y": y});
     if kind != "mouseMoved" {
         p["button"] = json!(button);
@@ -493,7 +523,7 @@ async fn mouse_btn(tab: i64, kind: &str, x: f64, y: f64, button: &str, count: u3
         p["button"] = json!(button);
         p["buttons"] = json!(1);
     }
-    cdp(tab, "Input.dispatchMouseEvent", p).await.map(|_| ())
+    p
 }
 
 /// A point to act on: `at: [x, y]`, else the centre of `target` (ref or selector).
@@ -628,7 +658,188 @@ async fn dispatch(r: &Request) -> Result<Value, String> {
     }
 }
 
+fn bounded_text(value: &Value, max: usize) -> String {
+    let text = value.as_str().unwrap_or("");
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut cut = max;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}\n… (truncated)", &text[..cut])
+}
+
+async fn main_page_action(tab: i64, url: &str, command: &str, args: &Value) -> Result<Value, String> {
+    let action = with(|s| s.page_action.clone()).ok_or("main-page actions are unavailable")?;
+    let options = to_js(&json!({
+        "target": {"tabId": tab, "frameIds": [0]},
+        "world": "ISOLATED",
+        "injectImmediately": true,
+        "args": [url, command, args],
+    }));
+    Reflect::set(&options, &"func".into(), action.as_ref()).map_err(js::err_text)?;
+    let result = from_js(call(&["chrome", "scripting"], "executeScript", vec![options]).await?);
+    if let Some(error) = result[0]["result"]["error"].as_str() {
+        return Err(error.to_string());
+    }
+    result[0]["result"].get("value").cloned().ok_or_else(|| "the main page did not return a result".into())
+}
+
+#[derive(Clone, Copy)]
+enum FallbackCommand {
+    Read,
+    Html,
+    Click,
+    Type,
+    Focus,
+    Select,
+}
+
+impl FallbackCommand {
+    fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "read" => Self::Read,
+            "html" => Self::Html,
+            "click" => Self::Click,
+            "type" => Self::Type,
+            "focus" => Self::Focus,
+            "select" => Self::Select,
+            _ => return None,
+        })
+    }
+}
+
+async fn page_fallback(r: &Request, tab: i64, command: FallbackCommand) -> Result<Value, String> {
+    let info = tab_info(tab).await?;
+    let url = info["url"].as_str().ok_or("the tab has no page URL")?;
+    let run = || main_page_action(tab, url, &r.cmd, &r.args);
+    match command {
+        FallbackCommand::Read => {
+            let mode = arg(r, "mode").as_str().unwrap_or("both");
+            if mode == "tree" {
+                return Err(PAGE_FALLBACK_NOTICE.into());
+            }
+            let max = arg(r, "max_chars").as_u64().map(|m| m as usize).unwrap_or(DEFAULT_MAX_CHARS);
+            let text = run().await?;
+            let mut out = json!({"text": bounded_text(&text, max)});
+            if mode != "text" {
+                out["notice"] = json!(PAGE_FALLBACK_NOTICE);
+            }
+            Ok(out)
+        }
+        FallbackCommand::Html => run().await,
+        FallbackCommand::Click => {
+            if arg(r, "at").is_array() || arg(r, "button").as_str().unwrap_or("left") != "left" || arg(r, "count").as_u64().unwrap_or(1) != 1 {
+                return Err(format!("{PAGE_FALLBACK_NOTICE} Only a single click by CSS selector is available."));
+            }
+            let target = arg_str(r, "target")?;
+            run().await?;
+            sleep(300).await;
+            let info = tab_info(tab).await?;
+            Ok(json!(format!("clicked {target} — now at {}", info["url"].as_str().unwrap_or(""))))
+        }
+        FallbackCommand::Type => {
+            let target = arg_str(r, "target")?;
+            let text = arg_str(r, "text")?;
+            run().await?;
+            Ok(json!(format!("typed {} characters into {target}", text.chars().count())))
+        }
+        FallbackCommand::Focus => {
+            run().await?;
+            Ok(json!("focused"))
+        }
+        FallbackCommand::Select => {
+            let value = run().await?;
+            Ok(json!(format!("selected {}", value.as_str().unwrap_or(""))))
+        }
+    }
+}
+
+fn debugger_blocked_by_extension_frame(error: &str) -> bool {
+    error.starts_with(EXTENSION_FRAME_DENIED) || error.split_once(": ").is_some_and(|(_, reason)| reason == EXTENSION_FRAME_DENIED)
+}
+
+async fn wait_for(r: &Request, tab: i64) -> Result<Value, String> {
+    let timeout = arg(r, "timeout_ms").as_f64().unwrap_or(15_000.0);
+    let (expr, what) = match (arg(r, "selector").as_str(), arg(r, "text").as_str()) {
+        (Some(sel), _) => (format!("!!document.querySelector({})", js_str(sel)), format!("`{sel}`")),
+        (None, Some(text)) => (
+            format!("!!(document.body && document.body.innerText.includes({}))", js_str(text)),
+            format!("\"{text}\""),
+        ),
+        _ => return Err("give a selector or --text".into()),
+    };
+    let gone = arg(r, "gone").as_bool().unwrap_or(false);
+    let end = now() + timeout;
+    loop {
+        let result = match eval(tab, &expr).await {
+            Err(e) if debugger_blocked_by_extension_frame(&e) => {
+                let info = tab_info(tab).await?;
+                let url = info["url"].as_str().ok_or("the tab has no page URL")?;
+                main_page_action(tab, url, "probe", &r.args).await.ok()
+            }
+            other => other.ok(),
+        };
+        // Navigation can temporarily destroy the context. An error never
+        // counts as a confirmation that the element is gone.
+        if result.as_ref().and_then(Value::as_bool) == Some(!gone) {
+            return Ok(json!(format!("{what} {}", if gone { "is gone" } else { "is there" })));
+        }
+        if now() > end {
+            return Err(format!("timed out waiting for {what}{}", if gone { " to go away" } else { "" }));
+        }
+        sleep(150).await;
+    }
+}
+
+async fn wait_stable(r: &Request, tab: i64) -> Result<Value, String> {
+    let quiet = arg(r, "quiet_ms").as_f64().unwrap_or(500.0).max(0.0);
+    let end = now() + arg(r, "timeout_ms").as_f64().unwrap_or(15_000.0);
+    loop {
+        match eval(tab, "document.readyState").await {
+            Ok(ready) => {
+                let (inflight, last) = with(|s| s.logs.get(&tab).map(|l| (l.inflight, l.last_net)).unwrap_or((0, 0.0)));
+                if ready == "complete" && inflight == 0 && now() - last >= quiet {
+                    return Ok(json!("page is stable"));
+                }
+            }
+            Err(e) if debugger_blocked_by_extension_frame(&e) => {
+                let info = tab_info(tab).await?;
+                let url = info["url"].as_str().ok_or("the tab has no page URL")?;
+                let budget = json!({"quietMs": quiet, "timeoutMs": (end - now()).max(0.0)});
+                match main_page_action(tab, url, "settle", &budget).await {
+                    Ok(_) => return Ok(json!("main page DOM is stable")),
+                    Err(e) => {
+                        let current = tab_info(tab).await?;
+                        if current["url"] == url && current["status"] != "loading" && e != "the web page changed before Hrafn could act" {
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+            Err(e) if e.contains("Execution context was destroyed") || e.contains("Cannot find context") => {}
+            Err(e) => return Err(e),
+        }
+        if now() >= end {
+            return Err("page did not settle before the timeout".into());
+        }
+        sleep(100).await;
+    }
+}
+
 async fn page_command(r: &Request, tab: i64) -> Result<Value, String> {
+    let fallback = FallbackCommand::from_name(&r.cmd);
+    let _click_guard = if matches!(fallback, Some(FallbackCommand::Click)) { Some(ClickGuard::acquire(tab)?) } else { None };
+    if let Some(command) = fallback {
+        // A tab can keep its attachment after another extension adds a frame.
+        // Probe permissions before doing anything that would be unsafe to repeat.
+        match cdp(tab, "Runtime.evaluate", json!({"expression": "true", "returnByValue": true})).await {
+            Err(e) if debugger_blocked_by_extension_frame(&e) => return page_fallback(r, tab, command).await,
+            Err(e) => return Err(e),
+            Ok(_) => {}
+        }
+    }
     if matches!(r.cmd.as_str(), "navigate" | "back" | "forward" | "reload") {
         // Attach before loading so the logs cover the whole load. Pages the browser
         // won't let extensions debug (settings, the web store) still navigate.
@@ -667,16 +878,7 @@ async fn page_command(r: &Request, tab: i64) -> Result<Value, String> {
                     Some(b) => call_on(tab, b, "function(){return this.innerText||this.textContent||''}", vec![]).await?,
                     None => eval(tab, "document.body ? document.body.innerText : ''").await?,
                 };
-                let mut text = text.as_str().unwrap_or("").to_string();
-                if text.len() > max {
-                    let mut cut = max;
-                    while !text.is_char_boundary(cut) {
-                        cut -= 1;
-                    }
-                    text.truncate(cut);
-                    text.push_str("\n… (truncated)");
-                }
-                out["text"] = json!(text);
+                out["text"] = json!(bounded_text(&text, max));
             }
             Ok(out)
         }
@@ -697,15 +899,51 @@ async fn page_command(r: &Request, tab: i64) -> Result<Value, String> {
             Ok(cdp(tab, "DOM.getOuterHTML", json!({"backendNodeId": b})).await?["outerHTML"].clone())
         }
         "click" | "hover" => {
-            let (x, y, what) = point(r, tab, "target", "at").await?;
-            mouse(tab, "mouseMoved", x, y).await?;
+            let moved = async {
+                let (x, y, what) = point(r, tab, "target", "at").await?;
+                mouse(tab, "mouseMoved", x, y).await?;
+                Ok::<_, String>((x, y, what))
+            }.await;
+            let (x, y, what) = match moved {
+                Err(e) if r.cmd == "click" && debugger_blocked_by_extension_frame(&e) => return page_fallback(r, tab, FallbackCommand::Click).await,
+                other => other?,
+            };
             let mut verb = "hovering over";
             if r.cmd == "click" {
                 let button = arg(r, "button").as_str().unwrap_or("left").to_string();
                 let count = arg(r, "count").as_u64().unwrap_or(1).clamp(1, 3) as u32;
-                for n in 1..=count {
-                    mouse_btn(tab, "mousePressed", x, y, &button, n).await?;
-                    mouse_btn(tab, "mouseReleased", x, y, &button, n).await?;
+                let mut receipt = None;
+                if button == "left" && count == 1 {
+                    let info = tab_info(tab).await?;
+                    if let Some(url) = info["url"].as_str().filter(|u| u.starts_with("http://") || u.starts_with("https://")) {
+                        let id = with(|s| {
+                            s.click_seq = s.click_seq.wrapping_add(1);
+                            s.click_seq.to_string()
+                        });
+                        let args = json!({"id": id, "x": x, "y": y});
+                        if main_page_action(tab, url, "watchClick", &args).await == Ok(json!(true)) {
+                            receipt = Some((url.to_string(), args));
+                        }
+                    }
+                }
+                let dispatched = async {
+                    for n in 1..=count {
+                        for event in ["mousePressed", "mouseReleased"] {
+                            // A dropped reply does not say whether the button event ran.
+                            // Send each event once and consult the document if the reply is lost.
+                            cdp_raw(tab, "Input.dispatchMouseEvent", mouse_event(event, x, y, &button, n)).await?;
+                        }
+                    }
+                    Ok::<(), String>(())
+                }.await;
+                let confirmed = match receipt {
+                    Some((url, args)) => main_page_action(tab, &url, "clickReceipt", &args).await == Ok(json!(true)),
+                    None => false,
+                };
+                if let Err(e) = dispatched {
+                    if !confirmed {
+                        return Err(format!("click outcome could not be confirmed ({e}). Check the page before retrying."));
+                    }
                 }
                 sleep(300).await;
                 verb = match (button.as_str(), count) {
@@ -732,29 +970,7 @@ async fn page_command(r: &Request, tab: i64) -> Result<Value, String> {
             sleep(200).await;
             Ok(json!(format!("dragged {from} to {to}")))
         }
-        "wait_for" => {
-            let timeout = arg(r, "timeout_ms").as_f64().unwrap_or(15_000.0);
-            let (expr, what) = match (arg(r, "selector").as_str(), arg(r, "text").as_str()) {
-                (Some(sel), _) => (format!("!!document.querySelector({})", js_str(sel)), format!("`{sel}`")),
-                (None, Some(text)) => (
-                    format!("!!(document.body && document.body.innerText.includes({}))", js_str(text)),
-                    format!("\"{text}\""),
-                ),
-                _ => return Err("give a selector or --text".into()),
-            };
-            let gone = arg(r, "gone").as_bool().unwrap_or(false);
-            let end = now() + timeout;
-            loop {
-                let present = eval(tab, &expr).await.map(|v| v == Value::Bool(true)).unwrap_or(false);
-                if present != gone {
-                    return Ok(json!(format!("{what} {}", if gone { "is gone" } else { "is there" })));
-                }
-                if now() > end {
-                    return Err(format!("timed out waiting for {what}{}", if gone { " to go away" } else { "" }));
-                }
-                sleep(150).await;
-            }
-        }
+        "wait_for" => wait_for(r, tab).await,
         "diff" => {
             let tree = read_tree(tab, None, usize::MAX).await?.tree;
             let before = with(|s| s.last_tree.insert(tab, tree.clone()));
@@ -975,22 +1191,7 @@ async fn page_command(r: &Request, tab: i64) -> Result<Value, String> {
             let y = eval(tab, "Math.round(window.scrollY)").await?;
             Ok(json!(format!("scrolled {dir} (y={y})")))
         }
-        "wait_stable" => {
-            attach(tab).await?;
-            let quiet = arg(r, "quiet_ms").as_f64().unwrap_or(500.0);
-            let end = now() + arg(r, "timeout_ms").as_f64().unwrap_or(15_000.0);
-            loop {
-                let ready = eval(tab, "document.readyState").await? == "complete";
-                let (inflight, last) = with(|s| s.logs.get(&tab).map(|l| (l.inflight, l.last_net)).unwrap_or((0, 0.0)));
-                if ready && inflight == 0 && now() - last >= quiet {
-                    return Ok(json!("page is stable"));
-                }
-                if now() > end {
-                    return Err(format!("still busy after the timeout ({inflight} requests in flight)"));
-                }
-                sleep(100).await;
-            }
-        }
+        "wait_stable" => wait_stable(r, tab).await,
         "screenshot" => {
             // A hidden tab never paints, so bring it to the front first.
             call(&["chrome", "tabs"], "update", vec![JsValue::from(tab as f64), to_js(&json!({"active": true}))]).await?;

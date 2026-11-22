@@ -81,7 +81,9 @@ pub fn build() {
         .arg(root.join("target/wasm32-unknown-unknown/release/hrafn_ext.wasm"))
         .args(["--target", "web", "--no-typescript", "--out-dir"])
         .arg(&dist));
-    std::fs::copy(root.join("extension/background.js"), dist.join("background.js")).unwrap();
+    for script in ["background.js", "page.js"] {
+        std::fs::copy(root.join("extension").join(script), dist.join(script)).unwrap();
+    }
     let version = env!("CARGO_PKG_VERSION");
     let manifest = serde_json::json!({
         "manifest_version": 3,
@@ -90,7 +92,7 @@ pub fn build() {
         "description": "Lets the hrafn command drive this browser from your terminal. Everything stays on your computer.",
         "key": public_key(),
         "minimum_chrome_version": "116",
-        "permissions": ["nativeMessaging", "debugger", "tabs", "cookies", "alarms"],
+        "permissions": ["nativeMessaging", "debugger", "tabs", "cookies", "alarms", "scripting"],
         "host_permissions": ["<all_urls>"],
         "background": { "service_worker": "background.js", "type": "module" },
         "content_security_policy": { "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'" }

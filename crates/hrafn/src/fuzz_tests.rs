@@ -17,6 +17,20 @@ fn plan_quote_split_round_trips() {
 }
 
 #[test]
+fn hand_written_plan_can_quote_javascript_with_single_quotes() {
+    let line = r#"eval 'document.body.dataset.note = "the raven"; /\w+/.test("raven")'"#;
+    assert_eq!(
+        plan::split(line).unwrap().unwrap(),
+        ["eval", r#"document.body.dataset.note = "the raven"; /\w+/.test("raven")"#]
+    );
+    assert_eq!(plan::split("type #field ''").unwrap().unwrap(), ["type", "#field", ""]);
+    assert_eq!(plan::split("click input[name='q']").unwrap().unwrap(), ["click", "input[name='q']"]);
+    assert_eq!(plan::split("type #field O'Brien").unwrap().unwrap(), ["type", "#field", "O'Brien"]);
+    assert_eq!(plan::split("type #field 'tis").unwrap().unwrap(), ["type", "#field", "'tis"]);
+    assert_eq!(plan::split("type #field 'tain't").unwrap().unwrap(), ["type", "#field", "'tain't"]);
+}
+
+#[test]
 fn plan_split_never_panics() {
     let mut rng = Rng::new(5);
     for _ in 0..50_000 {

@@ -4,10 +4,9 @@ Drive your real Brave (or Chrome) from the terminal: open pages, read them,
 click, type, take screenshots, and watch console and network activity. Your own
 browser, logins and profile, nothing sent anywhere.
 
-Everything is Rust. The command line tool and native host are a normal Rust
-binary; the browser extension's logic is Rust compiled to WebAssembly. The only
-JavaScript is `extension/background.js` (9 lines), because browsers start
-extensions from JavaScript, plus the loader `wasm-bindgen` generates.
+The command line tool and native host are Rust binaries. The browser extension
+runs Rust compiled to WebAssembly. JavaScript starts the extension and runs
+the recorder and basic page actions in the browser.
 
 ## How it works
 
@@ -22,6 +21,15 @@ hrafn (CLI) ──unix socket──▶ hrafn-host ──native messaging──�
 The extension controls tabs through the browser's debugger API. While a tab is
 attached, Brave shows a "Hrafn started debugging this browser" bar;
 `hrafn detach` removes it.
+
+If another extension embeds a frame that blocks debugger attachment, Hrafn can
+still read the web page's text and use CSS selectors for HTML, click, focus,
+type, select, and wait-for. These actions work in the main page. Fallback clicks
+and input events are synthetic. Accessibility refs, arbitrary JavaScript, and
+network inspection still need the debugger.
+If the debugger drops a reply during a click, Hrafn can confirm a matching
+browser click in the main page. An unconfirmed click should be checked before
+repeating the command.
 
 ### Sandboxed browsers (firejail)
 
@@ -127,9 +135,13 @@ Enter/Tab/Escape presses on the current tab. `hrafn record stop flow.txt` saves
 them as a plan: one hrafn command per line, editable, `#` for comments.
 `hrafn run flow.txt` replays it, waiting for the page to settle after each
 step, and prints ok/FAIL per line (it stops at the first failure unless
-`--keep-going`). Plans can also be written by hand. The recorder is the one
-other piece of JavaScript: it has to run inside the page to see your clicks,
-and only reports them to the Rust side.
+`--keep-going`). On tabs with a blocked debugger, it waits for the main page to
+load and its DOM to stop changing. Use `wait-for` when the next step needs a
+specific result. Hand-written plans accept matching single quotes at argument
+boundaries and double quotes with escapes. Bare apostrophes such as in `'tis`
+and `'tain't` are literal. `hrafn run - --quiet` reads a plan from
+stdin and prints only failed line numbers and a summary. Use it when plan
+arguments or results should stay out of terminal output.
 
 A *target* is a ref from `read` (`e12`) or a CSS selector. Refs reset when the
 page changes; run `read` again. Add `--tab ID` to act on a specific tab and

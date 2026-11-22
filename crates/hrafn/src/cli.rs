@@ -52,8 +52,9 @@ Recording and replay
   record start                 Record your clicks, typing, choices and Enter presses
   record stop [plan-file]      Stop and save (or print) the steps as a plan
   record status
-  run <plan-file | -> [--keep-going]
-                               Replay a plan: one hrafn command per line, # comments
+  run <plan-file | -> [--keep-going] [--quiet]
+                               Replay a plan: one command per line, # comments
+                               --quiet prints only line numbers and the summary
 
 Logs, network and cookies
   console [--limit N] [--clear]
@@ -493,6 +494,9 @@ fn send_and_print(cmd: &str, args: Value, tab: Option<i64>, raw_json: bool, rest
             }
         }
         "read" => {
+            if let Some(notice) = res["notice"].as_str() {
+                eprintln!("hrafn: {notice}");
+            }
             for key in ["tree", "text"] {
                 if let Some(s) = res[key].as_str() {
                     if key == "text" && res["tree"].is_string() {
@@ -570,13 +574,14 @@ fn net_body(res: &Value, rest: &[String]) -> i32 {
 }
 
 /// Commands after which a replay waits for the page to settle.
-const SETTLE_AFTER: [&str; 11] = ["open", "navigate", "back", "forward", "reload", "click", "type", "select", "keys", "drag", "tab"];
+const SETTLE_AFTER: [&str; 11] = ["open", "navigate", "back", "forward", "reload", "click", "type", "select", "keys", "drag", "switch"];
 
 /// Run a plan file (or `-` for stdin): one command per line.
 fn run_plan(rest: &[String], tab: Option<i64>) -> i32 {
     let keep_going = rest.iter().any(|a| a == "--keep-going");
+    let quiet = rest.iter().any(|a| a == "--quiet");
     let Some(src) = rest.iter().find(|a| !a.starts_with("--")) else {
-        return fail("usage: hrafn run <plan-file | -> [--keep-going]");
+        return fail("usage: hrafn run <plan-file | -> [--keep-going] [--quiet]");
     };
     let text = if src == "-" {
         let mut s = String::new();
@@ -596,7 +601,11 @@ fn run_plan(rest: &[String], tab: Option<i64>) -> i32 {
             Ok(Some(w)) => w,
             Ok(None) => continue,
             Err(e) => {
-                println!("FAIL line {}: {e}", n + 1);
+                if quiet {
+                    println!("FAIL line {}", n + 1);
+                } else {
+                    println!("FAIL line {}: {e}", n + 1);
+                }
                 failed += 1;
                 if keep_going { continue } else { break }
             }
@@ -613,29 +622,37 @@ fn run_plan(rest: &[String], tab: Option<i64>) -> i32 {
         } else if ["run", "doctor", "help", "screenshot"].contains(&cmd.as_str()) {
             Err(format!("`{cmd}` can't be used inside a plan"))
         } else {
-            build(cmd, args).and_then(|(name, a)| call(&name, a, tab)).and_then(|resp| {
-                if resp.ok {
-                    Ok(match &resp.result {
-                        Value::String(s) => s.clone(),
-                        Value::Object(o) if o.contains_key("title") => o["title"].as_str().unwrap_or("").to_string(),
-                        _ => "ok".into(),
-                    })
-                } else {
-                    Err(resp.error.unwrap_or_else(|| "failed".into()))
+            build(cmd, args).and_then(|(name, a)| {
+                let resp = call(&name, a, tab)?;
+                if !resp.ok {
+                    return Err(resp.error.unwrap_or_else(|| "failed".into()));
                 }
+                if SETTLE_AFTER.contains(&name.as_str()) {
+                    let settled = call("wait_stable", json!({ "quiet_ms": 300, "timeout_ms": 8000 }), tab)
+                        .and_then(|response| if response.ok { Ok(()) } else { Err(response.error.unwrap_or_else(|| "wait failed".into())) });
+                    settled.map_err(|e| format!("action completed, but the page did not settle: {e}"))?;
+                }
+                Ok(match &resp.result {
+                    Value::String(s) => s.clone(),
+                    Value::Object(o) if o.contains_key("title") => o["title"].as_str().unwrap_or("").to_string(),
+                    _ => "ok".into(),
+                })
             })
         };
         match result {
             Ok(msg) => {
                 passed += 1;
-                println!("ok   line {}: {}  ({})", n + 1, line.trim(), msg.lines().next().unwrap_or(""));
-                if SETTLE_AFTER.contains(&cmd.as_str()) {
-                    let _ = call("wait_stable", json!({ "quiet_ms": 300, "timeout_ms": 8000 }), tab);
+                if !quiet {
+                    println!("ok   line {}: {}  ({})", n + 1, line.trim(), msg.lines().next().unwrap_or(""));
                 }
             }
             Err(e) => {
                 failed += 1;
-                println!("FAIL line {}: {}  ({e})", n + 1, line.trim());
+                if quiet {
+                    println!("FAIL line {}", n + 1);
+                } else {
+                    println!("FAIL line {}: {}  ({e})", n + 1, line.trim());
+                }
                 if !keep_going {
                     break;
                 }

@@ -601,7 +601,11 @@ fn run_plan(rest: &[String], tab: Option<i64>) -> i32 {
             Ok(Some(w)) => w,
             Ok(None) => continue,
             Err(e) => {
-                println!("FAIL line {}: {e}", n + 1);
+                if quiet {
+                    println!("FAIL line {}", n + 1);
+                } else {
+                    println!("FAIL line {}: {e}", n + 1);
+                }
                 failed += 1;
                 if keep_going { continue } else { break }
             }

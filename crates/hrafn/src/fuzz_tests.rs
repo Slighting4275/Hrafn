@@ -25,6 +25,8 @@ fn hand_written_plan_can_quote_javascript_with_single_quotes() {
     );
     assert_eq!(plan::split("type #field ''").unwrap().unwrap(), ["type", "#field", ""]);
     assert!(plan::split("eval 'unclosed").is_err());
+    assert_eq!(plan::split("click input[name='q']").unwrap().unwrap(), ["click", "input[name='q']"]);
+    assert_eq!(plan::split("type #field O'Brien").unwrap().unwrap(), ["type", "#field", "O'Brien"]);
 }
 
 #[test]

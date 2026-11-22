@@ -4,10 +4,9 @@ Drive your real Brave (or Chrome) from the terminal: open pages, read them,
 click, type, take screenshots, and watch console and network activity. Your own
 browser, logins and profile, nothing sent anywhere.
 
-Everything is Rust. The command line tool and native host are a normal Rust
-binary; the browser extension's logic is Rust compiled to WebAssembly. The only
-JavaScript is `extension/background.js` (9 lines), because browsers start
-extensions from JavaScript, plus the loader `wasm-bindgen` generates.
+The command line tool and native host are Rust binaries. The browser extension
+runs Rust compiled to WebAssembly. JavaScript starts the extension and runs
+the recorder and basic page actions in the browser.
 
 ## How it works
 

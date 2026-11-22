@@ -226,7 +226,7 @@ fn extension_frame_fixture(dir: &Path) {
         "manifest_version": 3,
         "name": "Hrafn extension frame fixture",
         "version": "1.0",
-        "content_scripts": [{"matches": ["http://127.0.0.1/extension-frame"], "js": ["embed.js"]}],
+        "content_scripts": [{"matches": ["http://127.0.0.1/extension-frame*"], "js": ["embed.js"]}],
         "web_accessible_resources": [{"resources": ["frame.html"], "matches": ["http://127.0.0.1/*"]}]
     }).to_string()).unwrap();
     std::fs::write(dir.join("embed.js"), r#"
@@ -234,10 +234,31 @@ fn extension_frame_fixture(dir: &Path) {
         frame.id = 'other-extension';
         frame.src = chrome.runtime.getURL('frame.html');
         frame.addEventListener('load', () => document.body.append('Extension frame loaded'));
-        document.body.prepend(frame);
+        if (location.search === '?dynamic') {
+            const show = document.createElement('button');
+            show.id = 'show-extension-frame';
+            show.textContent = 'Show extension frame';
+            show.addEventListener('click', () => setTimeout(() => document.body.prepend(frame), 700));
+            document.body.prepend(show);
+        } else {
+            document.body.prepend(frame);
+        }
         document.querySelector('#q').addEventListener('input', (event) => {
             document.querySelector('#out').textContent = `field received ${event.target.value.length} characters`;
         });
+        const number = document.createElement('input');
+        number.type = 'number';
+        number.id = 'fixture-number';
+        number.addEventListener('input', () => document.querySelector('#out').textContent = `numeric value ${number.value}`);
+        document.body.prepend(number);
+        const changeAddress = document.createElement('button');
+        changeAddress.id = 'change-address';
+        changeAddress.textContent = 'Change address';
+        changeAddress.addEventListener('click', () => setTimeout(() => {
+            location.hash = 'changed';
+            document.body.append('Address change complete');
+        }, 700));
+        document.body.prepend(changeAddress);
     "#).unwrap();
     std::fs::write(dir.join("frame.html"), "<!doctype html><p>Private fixture frame content</p>").unwrap();
 }
@@ -476,6 +497,14 @@ pub fn run(unsandboxed: bool) {
         c.failures.push("quiet replay".into());
     }
     c.check("single-quoted replay sets the intended value", &["eval", "document.body.dataset.note"], |o| o.trim() == "fixture secret");
+    std::fs::write(&plan, "eval 'fixture secret\n").unwrap();
+    let (ok, out, err) = c.h(&["run", &plan_s, "--quiet"]);
+    if !ok && out.trim() == "FAIL line 1\n0 passed, 1 failed" && err.is_empty() {
+        eprintln!("PASS quiet replay keeps parse diagnostics out of its output");
+    } else {
+        eprintln!("FAIL quiet replay parse error: {out}{err}");
+        c.failures.push("quiet replay parse error".into());
+    }
     let shot = work.join("shot.png");
     let shot_s = shot.display().to_string();
     c.check("screenshot", &["screenshot", &shot_s], |_| true);
@@ -550,6 +579,15 @@ pub fn run(unsandboxed: bool) {
     });
     c.check("type in the top-level form with an extension frame", &["type", "#q", "fixture input"], |o| o.contains("typed 13 characters"));
     c.check("the top-level form receives the input event", &["read", "#out", "--text-only"], |o| o.trim() == "field received 13 characters");
+    c.check("type in a numeric field with a blocked debugger", &["type", "#fixture-number", "17"], |o| o.contains("typed 2 characters"));
+    c.check("the numeric field receives the input event", &["read", "#out", "--text-only"], |o| o.trim() == "numeric value 17");
+    let (ok, _, err) = c.h(&["focus", "#out"]);
+    if !ok && err.contains("element did not receive focus") {
+        eprintln!("PASS fallback focus checks whether the target gained focus");
+    } else {
+        eprintln!("FAIL fallback focus on an unfocusable element: {err}");
+        c.failures.push("fallback focus on an unfocusable element".into());
+    }
     let (ok, _, err) = c.h(&["wait-for", "#q", "--gone", "--timeout", "200"]);
     if !ok && err.contains("timed out waiting for `#q` to go away") {
         eprintln!("PASS wait-for --gone still detects the form field");
@@ -566,7 +604,16 @@ pub fn run(unsandboxed: bool) {
     }
     c.check("click the top-level button with an extension frame", &["click", "#go"], |o| o.contains("clicked #go"));
     c.check("read the result of the top-level click", &["read", "--text-only"], |o| o.contains("clicked"));
+    c.check("start the delayed address change", &["click", "#change-address"], |o| o.contains("clicked #change-address"));
+    c.check("wait through the address change with a blocked debugger", &["wait-for", "--text", "Address change complete", "--timeout", "2500"], |o| o.contains("is there"));
     c.check("close the extension frame test page", &["tab", "close"], |o| o.contains("closed tab"));
+    c.check("open the dynamic extension frame test page", &["tab", "new", &format!("{site}/extension-frame?dynamic")], |o| o.contains("Hrafn test page"));
+    c.check("attach before the frame appears", &["tree"], |o| o.contains("Show extension frame"));
+    c.check("show the frame on an attached tab", &["click", "#show-extension-frame"], |o| o.contains("clicked #show-extension-frame"));
+    // Let the subframe finish navigating before the next debugger command.
+    std::thread::sleep(Duration::from_millis(900));
+    c.check("read after the debugger loses access", &["read", "--text-only"], |o| o.contains("Extension frame loaded"));
+    c.check("close the dynamic extension frame test page", &["tab", "close"], |o| o.contains("closed tab"));
 
     // ---- site adapters, against local mock-ups of each site's page structure
     c.check("open mock ChatGPT", &["navigate", &format!("{site}/chatgpt")], |o| o.contains("ChatGPT"));

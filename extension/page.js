@@ -38,7 +38,7 @@ export function pageAction(expectedUrl, command, args) {
       case 'focus':
         if (typeof element.focus !== 'function') return fail('element cannot be focused');
         element.focus();
-        return ok(null);
+        return document.activeElement === element ? ok(null) : fail('element did not receive focus');
       case 'select':
         if (!(element instanceof HTMLSelectElement)) return fail('target is not a select element');
         if (![...element.options].some((option) => option.value === args.value && !option.matches(':disabled'))) {
@@ -50,7 +50,7 @@ export function pageAction(expectedUrl, command, args) {
         return ok(element.value);
       case 'type': {
         const textInput = element instanceof HTMLInputElement &&
-          ['text', 'search', 'password', 'email', 'tel', 'url'].includes(element.type);
+          ['text', 'search', 'password', 'email', 'tel', 'url', 'number'].includes(element.type);
         if (textInput || element instanceof HTMLTextAreaElement) {
           if (element.readOnly) return fail('element is read-only');
           element.focus();

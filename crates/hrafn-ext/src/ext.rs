@@ -678,7 +678,6 @@ async fn page_fallback(r: &Request, tab: i64) -> Result<Value, String> {
             }
             Ok(out)
         }
-        "wait_for" => wait_for(r, tab, Some(url)).await,
         "html" => main_page_action(r, tab, url, "html").await,
         "click" => {
             if arg(r, "at").is_array() || arg(r, "button").as_str().unwrap_or("left") != "left" || arg(r, "count").as_u64().unwrap_or(1) != 1 {
@@ -708,7 +707,11 @@ async fn page_fallback(r: &Request, tab: i64) -> Result<Value, String> {
     }
 }
 
-async fn wait_for(r: &Request, tab: i64, fallback_url: Option<&str>) -> Result<Value, String> {
+fn debugger_blocked_by_extension_frame(error: &str) -> bool {
+    error.starts_with(EXTENSION_FRAME_DENIED) || error.split_once(": ").is_some_and(|(_, reason)| reason == EXTENSION_FRAME_DENIED)
+}
+
+async fn wait_for(r: &Request, tab: i64) -> Result<Value, String> {
     let timeout = arg(r, "timeout_ms").as_f64().unwrap_or(15_000.0);
     let (expr, what) = match (arg(r, "selector").as_str(), arg(r, "text").as_str()) {
         (Some(sel), _) => (format!("!!document.querySelector({})", js_str(sel)), format!("`{sel}`")),
@@ -721,11 +724,17 @@ async fn wait_for(r: &Request, tab: i64, fallback_url: Option<&str>) -> Result<V
     let gone = arg(r, "gone").as_bool().unwrap_or(false);
     let end = now() + timeout;
     loop {
-        let result = match fallback_url {
-            Some(url) => main_page_action(r, tab, url, "probe").await?,
-            None => eval(tab, &expr).await?,
+        let result = match eval(tab, &expr).await {
+            Err(e) if debugger_blocked_by_extension_frame(&e) => {
+                let info = tab_info(tab).await?;
+                let url = info["url"].as_str().ok_or("the tab has no page URL")?;
+                main_page_action(r, tab, url, "probe").await.ok()
+            }
+            other => other.ok(),
         };
-        if result.as_bool() == Some(!gone) {
+        // Navigation can temporarily destroy the context. An error never
+        // counts as a confirmation that the element is gone.
+        if result.as_ref().and_then(Value::as_bool) == Some(!gone) {
             return Ok(json!(format!("{what} {}", if gone { "is gone" } else { "is there" })));
         }
         if now() > end {
@@ -736,11 +745,13 @@ async fn wait_for(r: &Request, tab: i64, fallback_url: Option<&str>) -> Result<V
 }
 
 async fn page_command(r: &Request, tab: i64) -> Result<Value, String> {
-    if matches!(r.cmd.as_str(), "wait_for" | "read" | "html" | "click" | "focus" | "type" | "select") {
-        match attach(tab).await {
-            Err(e) if e.starts_with(EXTENSION_FRAME_DENIED) => return page_fallback(r, tab).await,
+    if matches!(r.cmd.as_str(), "read" | "html" | "click" | "focus" | "type" | "select") {
+        // A tab can keep its attachment after another extension adds a frame.
+        // Probe permissions before doing anything that would be unsafe to repeat.
+        match cdp(tab, "Runtime.evaluate", json!({"expression": "true", "returnByValue": true})).await {
+            Err(e) if debugger_blocked_by_extension_frame(&e) => return page_fallback(r, tab).await,
             Err(e) => return Err(e),
-            Ok(()) => {}
+            Ok(_) => {}
         }
     }
     if matches!(r.cmd.as_str(), "navigate" | "back" | "forward" | "reload") {
@@ -837,7 +848,7 @@ async fn page_command(r: &Request, tab: i64) -> Result<Value, String> {
             sleep(200).await;
             Ok(json!(format!("dragged {from} to {to}")))
         }
-        "wait_for" => wait_for(r, tab, None).await,
+        "wait_for" => wait_for(r, tab).await,
         "diff" => {
             let tree = read_tree(tab, None, usize::MAX).await?.tree;
             let before = with(|s| s.last_tree.insert(tab, tree.clone()));

@@ -10,7 +10,7 @@
 
 use serde_json::Value;
 
-/// Split one line into words. Single quotes preserve literal text. Inside double quotes, `\"`, `\\`,
+/// Split one line into words. A leading single quote preserves literal text. Inside double quotes, `\"`, `\\`,
 /// `\n`, `\r` and `\t` are escapes (so multi-line text fits on one plan line).
 /// Returns `None` for blank lines and comments.
 pub fn split(line: &str) -> Result<Option<Vec<String>>, String> {
@@ -24,7 +24,7 @@ pub fn split(line: &str) -> Result<Option<Vec<String>>, String> {
     let mut chars = line.chars();
     while let Some(c) = chars.next() {
         match c {
-            '"' | '\'' => {
+            '"' | '\'' if c == '"' || !in_word => {
                 in_word = true;
                 loop {
                     match chars.next() {

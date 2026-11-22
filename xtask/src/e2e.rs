@@ -141,6 +141,7 @@ fn serve() -> String {
             };
             let resp = match path {
                 "/" => html(PAGE_ONE),
+                "/extension-frame" => html(PAGE_ONE),
                 "/two" => html(PAGE_TWO),
                 p if p == "/chatgpt" || p.starts_with("/c/") => html(FAKE_CHATGPT),
                 "/li/job" => html(FAKE_LINKEDIN_JOB),
@@ -198,11 +199,12 @@ impl Ctx {
     }
 }
 
-fn launch(brave: &str, profile: &Path, ext: &Path, sock: &Path) -> Child {
+fn launch(brave: &str, profile: &Path, ext: &Path, fixture: &Path, sock: &Path) -> Child {
+    let extensions = format!("{},{}", ext.display(), fixture.display());
     Command::new(brave)
         .arg(format!("--user-data-dir={}", profile.display()))
-        .arg(format!("--load-extension={}", ext.display()))
-        .arg(format!("--disable-extensions-except={}", ext.display()))
+        .arg(format!("--load-extension={extensions}"))
+        .arg(format!("--disable-extensions-except={extensions}"))
         .args([
             "--headless=new",
             "--no-first-run",
@@ -216,6 +218,28 @@ fn launch(brave: &str, profile: &Path, ext: &Path, sock: &Path) -> Child {
         .stderr(Stdio::piped())
         .spawn()
         .expect("start Brave (set BRAVE_BIN if it is not on PATH)")
+}
+
+fn extension_frame_fixture(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join("manifest.json"), serde_json::json!({
+        "manifest_version": 3,
+        "name": "Hrafn extension frame fixture",
+        "version": "1.0",
+        "content_scripts": [{"matches": ["http://127.0.0.1/extension-frame"], "js": ["embed.js"]}],
+        "web_accessible_resources": [{"resources": ["frame.html"], "matches": ["http://127.0.0.1/*"]}]
+    }).to_string()).unwrap();
+    std::fs::write(dir.join("embed.js"), r#"
+        const frame = document.createElement('iframe');
+        frame.id = 'other-extension';
+        frame.src = chrome.runtime.getURL('frame.html');
+        frame.addEventListener('load', () => document.body.append('Extension frame loaded'));
+        document.body.prepend(frame);
+        document.querySelector('#q').addEventListener('input', (event) => {
+            document.querySelector('#out').textContent = `field received ${event.target.value.length} characters`;
+        });
+    "#).unwrap();
+    std::fs::write(dir.join("frame.html"), "<!doctype html><p>Private fixture frame content</p>").unwrap();
 }
 
 /// Brave reads native host files from its standard folder even when started with
@@ -291,8 +315,10 @@ pub fn run(unsandboxed: bool) {
     }
     let sock = work.join("hrafn.sock");
     let site = serve();
+    let fixture = work.join("extension-frame-fixture");
+    extension_frame_fixture(&fixture);
 
-    let mut brave = launch(&brave, &profile, &ext, &sock);
+    let mut brave = launch(&brave, &profile, &ext, &fixture, &sock);
     let start = Instant::now();
     while !sock.exists() && start.elapsed() < Duration::from_secs(30) {
         std::thread::sleep(Duration::from_millis(200));
@@ -441,6 +467,15 @@ pub fn run(unsandboxed: bool) {
         c.check("close a replay tab", &["tab", "close", &id], |o| o.contains("closed tab"));
     }
     c.check("switch back to the test tab", &["tab", "switch", &test_tab], |o| o.contains("submitted:ravens"));
+    std::fs::write(&plan, "eval 'document.body.dataset.note = \"fixture secret\"'\neval 'throw new Error(\"fixture secret\")'\n").unwrap();
+    let (ok, out, err) = c.h(&["run", &plan_s, "--quiet"]);
+    if !ok && out.trim() == "FAIL line 2\n1 passed, 1 failed" && err.is_empty() {
+        eprintln!("PASS quiet replay keeps plan details out of its output");
+    } else {
+        eprintln!("FAIL quiet replay: {out}{err}");
+        c.failures.push("quiet replay".into());
+    }
+    c.check("single-quoted replay sets the intended value", &["eval", "document.body.dataset.note"], |o| o.trim() == "fixture secret");
     let shot = work.join("shot.png");
     let shot_s = shot.display().to_string();
     c.check("screenshot", &["screenshot", &shot_s], |_| true);
@@ -507,6 +542,31 @@ pub fn run(unsandboxed: bool) {
     c.check("tab new", &["tab", "new", &format!("{site}/two")], |o| o.contains("Page two"));
     c.check("tab close", &["tab", "close"], |o| o.contains("closed tab"));
     c.check("detach", &["detach"], |o| o.contains("stopped debugging"));
+
+    c.check("open a form with another extension frame", &["tab", "new", &format!("{site}/extension-frame")], |o| o.contains("Hrafn test page"));
+    c.check("wait for extension frame", &["wait-for", "--text", "Extension frame loaded", "--timeout", "2000"], |o| o.contains("is there"));
+    c.check("read the top-level page with an extension frame", &["read", "--text-only"], |o| {
+        o.contains("Extension frame loaded") && !o.contains("Private fixture frame content")
+    });
+    c.check("type in the top-level form with an extension frame", &["type", "#q", "fixture input"], |o| o.contains("typed 13 characters"));
+    c.check("the top-level form receives the input event", &["read", "#out", "--text-only"], |o| o.trim() == "field received 13 characters");
+    let (ok, _, err) = c.h(&["wait-for", "#q", "--gone", "--timeout", "200"]);
+    if !ok && err.contains("timed out waiting for `#q` to go away") {
+        eprintln!("PASS wait-for --gone still detects the form field");
+    } else {
+        eprintln!("FAIL wait-for --gone with a blocked debugger: {err}");
+        c.failures.push("wait-for --gone with a blocked debugger".into());
+    }
+    let (ok, _, err) = c.h(&["eval", "document.title"]);
+    if !ok && err.contains("Cannot access a chrome-extension:// URL of different extension") {
+        eprintln!("PASS arbitrary evaluation still needs the debugger");
+    } else {
+        eprintln!("FAIL arbitrary evaluation with a blocked debugger: {err}");
+        c.failures.push("eval with a blocked debugger".into());
+    }
+    c.check("click the top-level button with an extension frame", &["click", "#go"], |o| o.contains("clicked #go"));
+    c.check("read the result of the top-level click", &["read", "--text-only"], |o| o.contains("clicked"));
+    c.check("close the extension frame test page", &["tab", "close"], |o| o.contains("closed tab"));
 
     // ---- site adapters, against local mock-ups of each site's page structure
     c.check("open mock ChatGPT", &["navigate", &format!("{site}/chatgpt")], |o| o.contains("ChatGPT"));

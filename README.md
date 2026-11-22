@@ -23,6 +23,12 @@ The extension controls tabs through the browser's debugger API. While a tab is
 attached, Brave shows a "Hrafn started debugging this browser" bar;
 `hrafn detach` removes it.
 
+If another extension embeds a frame that blocks debugger attachment, Hrafn can
+still read the web page's text and use CSS selectors for HTML, click, focus,
+type, select, and wait-for. These actions work in the main page. Fallback clicks
+and input events are synthetic. Accessibility refs, arbitrary JavaScript, and
+network inspection still need the debugger.
+
 ### Sandboxed browsers (firejail)
 
 If your browser runs under firejail, its AppArmor profile only lets it run
@@ -127,9 +133,10 @@ Enter/Tab/Escape presses on the current tab. `hrafn record stop flow.txt` saves
 them as a plan: one hrafn command per line, editable, `#` for comments.
 `hrafn run flow.txt` replays it, waiting for the page to settle after each
 step, and prints ok/FAIL per line (it stops at the first failure unless
-`--keep-going`). Plans can also be written by hand. The recorder is the one
-other piece of JavaScript: it has to run inside the page to see your clicks,
-and only reports them to the Rust side.
+`--keep-going`). Hand-written plans accept literal single-quoted arguments and
+double-quoted arguments with escapes. `hrafn run - --quiet` reads a plan from
+stdin and prints only failed line numbers and a summary. Use it when plan
+arguments or results should stay out of terminal output.
 
 A *target* is a ref from `read` (`e12`) or a CSS selector. Refs reset when the
 page changes; run `read` again. Add `--tab ID` to act on a specific tab and
